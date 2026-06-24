@@ -52,11 +52,11 @@ export class StorageService {
         try {
           const item = JSON.parse(line);
           if (item.type === 'entity') {
-            const { type, ...entity } = item;
+            const { type: _type, ...entity } = item;
             graph.entities.push(entity as Entity);
           }
           if (item.type === 'relation') {
-            const { type, ...relation } = item;
+            const { type: _type, ...relation } = item;
             graph.relations.push(relation as Relation);
           }
         } catch (parseError) {
