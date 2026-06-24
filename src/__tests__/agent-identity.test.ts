@@ -17,7 +17,7 @@ function mockManager(entities: any[] = [], relations: any[] = []) {
 }
 
 const boinxContext: AgentContext = { agentId: 'boinx' };
-const j5Context: AgentContext = { agentId: 'j5' };
+const _j5Context: AgentContext = { agentId: 'j5' };
 
 describe('createEntities with AgentContext', () => {
   it('injects authored_by observation when agentContext provided', async () => {
