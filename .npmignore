@@ -1,0 +1,31 @@
+# Source & config
+src/
+tsconfig*.json
+eslint.config.js
+.prettierrc*
+.editorconfig
+
+# CI & GitHub
+.github/
+CLAUDE.md
+CONTRIBUTING.md
+SECURITY.md
+CHANGELOG.md
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Skills & docs
+skills/
+
+# Tests & dev
+**/__tests__/
+**/*.test.ts
+**/*.test.js
+**/*.spec.ts
+**/*.spec.js
+
+# Misc
+.gitignore
+*.tgz
