@@ -14,12 +14,12 @@
   ],
   "author": "Meldrey <meldrey@arktechnwa.com>",
   "license": "MIT",
-  "homepage": "https://github.com/arktechnwa/j5ed-knowledge-graph",
+  "homepage": "https://github.com/ArkTechNWA/j5ed-knowledge-graph",
   "repository": {
     "type": "git",
-    "url": "https://github.com/arktechnwa/j5ed-knowledge-graph"
+    "url": "https://github.com/ArkTechNWA/j5ed-knowledge-graph"
   },
-  "bugs": "https://github.com/arktechnwa/j5ed-knowledge-graph/issues",
+  "bugs": "https://github.com/ArkTechNWA/j5ed-knowledge-graph/issues",
   "bin": {
     "j5ed-knowledge-graph": "dist/index.js"
   },
