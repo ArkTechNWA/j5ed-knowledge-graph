@@ -2,21 +2,30 @@
   "name": "j5ed-knowledge-graph",
   "version": "1.0.0",
   "description": "A knowledge graph memory server for MCP with multi-agent tenant isolation, tiered search, index navigation, and three transport modes",
-  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "knowledge-graph",
+    "memory",
+    "multi-agent",
+    "model-context-protocol",
+    "tenant-isolation",
+    "ndjson",
+    "graph-database"
+  ],
   "author": "Meldrey <meldrey@arktechnwa.com>",
+  "license": "MIT",
+  "homepage": "https://github.com/arktechnwa/j5ed-knowledge-graph",
   "repository": {
     "type": "git",
     "url": "https://github.com/arktechnwa/j5ed-knowledge-graph"
   },
-  "homepage": "https://github.com/arktechnwa/j5ed-knowledge-graph",
   "bugs": "https://github.com/arktechnwa/j5ed-knowledge-graph/issues",
-  "type": "module",
   "bin": {
     "j5ed-knowledge-graph": "dist/index.js"
   },
-  "files": [
-    "dist"
-  ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "build": "tsc && shx chmod +x dist/*.js",
     "prepare": "npm run build",
@@ -50,7 +59,8 @@
     "ts-node": "^10.9.2",
     "typescript": "^6.0.3"
   },
-  "engines": {
-    "node": ">=18"
-  }
+  "type": "module",
+  "files": [
+    "dist"
+  ]
 }
