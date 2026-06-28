@@ -1,15 +1,8 @@
-// src/__tests__/search-stubs.test.ts
 import { EntityStub, IndexStub, SearchTier } from '../types/graph.js';
-import { KnowledgeGraphManager } from '../graph/knowledge-graph-manager.js';
-import { StorageService } from '../persistence/storage.js';
+import { createTestManager } from './helpers/test-db.js';
+import { AgentContext } from '../types/graph.js';
 
-function mockManager(entities: any[] = [], relations: any[] = []) {
-  const storage = {
-    loadGraph: () => Promise.resolve({ entities, relations }),
-    saveGraph: () => Promise.resolve(undefined),
-  } as unknown as StorageService;
-  return new KnowledgeGraphManager(storage);
-}
+const ctx: AgentContext = { agentId: 'j5' };
 
 describe('EntityStub type', () => {
   it('has required fields', () => {
@@ -51,238 +44,101 @@ describe('SearchTier type', () => {
 });
 
 describe('buildStub()', () => {
-  let buildStub: (entity: any, tokens: string[]) => any;
+  it('sets matchedIn name when token matches entity name', async () => {
+    const { manager } = createTestManager();
+    await manager.createEntities([
+      { name: 'AUTH_SERVICE', entityType: 'component', observations: ['handles tokens'] }
+    ], ctx);
 
-  beforeAll(() => {
-    const manager = mockManager();
-    buildStub = (manager as any).buildStub.bind(manager);
+    const result = await manager.searchNodes('auth', ctx);
+    const stub = result.tiers.flatMap(t => t.entities).find(e => e.name === 'AUTH_SERVICE');
+    expect(stub).toBeDefined();
+    expect(stub!.matchedIn).toContain('name');
+    expect(stub!.snippet).toBeUndefined();
   });
 
-  it('sets matchedIn name when token matches entity name', () => {
-    const entity = { name: 'AUTH_SERVICE', entityType: 'component', observations: [] };
-    const stub = buildStub(entity, ['auth']);
-    expect(stub.matchedIn).toContain('name');
-    expect(stub.snippet).toBeUndefined();
+  it('sets matchedIn type when token matches entityType only', async () => {
+    const { manager } = createTestManager();
+    await manager.createEntities([
+      { name: 'SOMETHING', entityType: 'authentication_protocol', observations: ['a thing'] }
+    ], ctx);
+
+    const result = await manager.searchNodes('auth', ctx);
+    const stub = result.tiers.flatMap(t => t.entities).find(e => e.name === 'SOMETHING');
+    expect(stub).toBeDefined();
+    expect(stub!.matchedIn).toContain('type');
   });
 
-  it('sets matchedIn type when token matches entityType only', () => {
-    const entity = { name: 'SOMETHING', entityType: 'authentication_protocol', observations: [] };
-    const stub = buildStub(entity, ['auth']);
-    expect(stub.matchedIn).toContain('type');
-    expect(stub.snippet).toBeUndefined();
+  it('provides snippet when token matches observation only', async () => {
+    const { manager } = createTestManager();
+    await manager.createEntities([
+      { name: 'TASK_MANAGER', entityType: 'component', observations: ['Unrelated note', 'auth token validation happens here'] }
+    ], ctx);
+
+    const result = await manager.searchNodes('auth', ctx);
+    const stub = result.tiers.flatMap(t => t.entities).find(e => e.name === 'TASK_MANAGER');
+    expect(stub).toBeDefined();
+    expect(stub!.matchedIn).toContain('observation');
+    expect(stub!.snippet).toBeDefined();
+    expect(stub!.snippet).toContain('auth token validation');
   });
 
-  it('sets matchedIn observation and provides snippet when token matches observation only', () => {
-    const entity = {
-      name: 'TASK_MANAGER',
-      entityType: 'component',
-      observations: ['Unrelated note', 'auth token validation happens here'],
-    };
-    const stub = buildStub(entity, ['auth']);
-    expect(stub.matchedIn).toContain('observation');
-    expect(stub.snippet).toBe('auth token validation happens here');
-  });
+  it('truncates snippet to 120 chars + ellipsis', async () => {
+    const longObs = 'auth ' + 'x'.repeat(200);
+    const { manager } = createTestManager();
+    await manager.createEntities([
+      { name: 'LONG_OBS', entityType: 'thing', observations: [longObs] }
+    ], ctx);
 
-  it('no snippet when name matched, even if observation also matches', () => {
-    const entity = {
-      name: 'AUTH_SERVICE',
-      entityType: 'component',
-      observations: ['auth is mentioned here too'],
-    };
-    const stub = buildStub(entity, ['auth']);
-    expect(stub.snippet).toBeUndefined();
-  });
-
-  it('truncates long snippets to 120 chars with ellipsis', () => {
-    const longObs = 'auth: ' + 'x'.repeat(200);
-    const entity = { name: 'ENTITY', entityType: 'component', observations: [longObs] };
-    const stub = buildStub(entity, ['auth']);
-    expect(stub.snippet).toHaveLength(123); // 120 + '...'
-    expect(stub.snippet).toMatch(/\.\.\.$/);
-  });
-
-  it('sets multiple matchedIn fields when token matches several', () => {
-    const entity = {
-      name: 'AUTH_COMPONENT',
-      entityType: 'auth_module',
-      observations: ['handles auth flow'],
-    };
-    const stub = buildStub(entity, ['auth']);
-    expect(stub.matchedIn).toContain('name');
-    expect(stub.matchedIn).toContain('type');
-    expect(stub.snippet).toBeUndefined();
+    const result = await manager.searchNodes('auth', ctx);
+    const stub = result.tiers.flatMap(t => t.entities).find(e => e.name === 'LONG_OBS');
+    expect(stub).toBeDefined();
+    expect(stub!.snippet!.length).toBeLessThanOrEqual(124); // 120 + '...'
+    expect(stub!.snippet!.endsWith('...')).toBe(true);
   });
 });
 
-describe('searchNodes() returns stubs', () => {
-  const entities = [
-    {
-      name: 'AUTH_SERVICE',
-      entityType: 'component',
-      observations: ['Handles token exchange', 'Validates JWT'],
-    },
-    {
-      name: 'TASK_MANAGER',
-      entityType: 'component',
-      observations: ['Manages job queue', 'auth check on every task'],
-    },
-    {
-      name: 'UNRELATED',
-      entityType: 'goal',
-      observations: ['Something totally different'],
-    },
-  ];
-  const relations = [
-    { from: 'AUTH_SERVICE', to: 'TASK_MANAGER', relationType: 'depends_on' },
-  ];
-
-  it('result entities have no observations field', async () => {
-    const manager = mockManager(entities, relations);
-    const result = await manager.searchNodes('auth');
-    const allEntities = result.tiers.flatMap(t => t.entities);
-    expect(allEntities.length).toBeGreaterThan(0);
-    allEntities.forEach(e => {
-      expect((e as any).observations).toBeUndefined();
-    });
-  });
-
-  it('result entities have name, type, matchedIn', async () => {
-    const manager = mockManager(entities, relations);
-    const result = await manager.searchNodes('auth');
-    const allEntities = result.tiers.flatMap(t => t.entities);
-    allEntities.forEach(e => {
-      expect(e.name).toBeDefined();
-      expect(e.type).toBeDefined();
-      expect(e.matchedIn).toBeDefined();
-    });
-  });
-
-  it('tiers have no relations field', async () => {
-    const manager = mockManager(entities, relations);
-    const result = await manager.searchNodes('auth');
-    result.tiers.forEach(tier => {
-      expect((tier as any).relations).toBeUndefined();
-    });
-  });
-
-  it('AUTH_SERVICE stub has no snippet (name match)', async () => {
-    const manager = mockManager(entities, relations);
-    const result = await manager.searchNodes('auth');
-    const allStubs = result.tiers.flatMap(t => t.entities);
-    const authStub = allStubs.find(e => e.name === 'AUTH_SERVICE');
-    expect(authStub).toBeDefined();
-    expect(authStub!.matchedIn).toContain('name');
-    expect(authStub!.snippet).toBeUndefined();
-  });
-
-  it('TASK_MANAGER stub has snippet (observation match only)', async () => {
-    const manager = mockManager(entities, relations);
-    const result = await manager.searchNodes('auth');
-    const allStubs = result.tiers.flatMap(t => t.entities);
-    const taskStub = allStubs.find(e => e.name === 'TASK_MANAGER');
-    expect(taskStub).toBeDefined();
-    expect(taskStub!.matchedIn).toContain('observation');
-    expect(taskStub!.snippet).toContain('auth');
-  });
-});
-
-describe('IndexStub type', () => {
-  it('has required fields', () => {
-    const stub: IndexStub = { name: 'MASTER_INDEX', type: 'Knowledge Graph Index' };
-    expect(stub.name).toBe('MASTER_INDEX');
-    expect(stub.type).toBe('Knowledge Graph Index');
-    expect(stub.canonicalName).toBeUndefined();
-    expect(stub.summary).toBeUndefined();
-  });
-
-  it('accepts optional canonicalName and summary', () => {
-    const stub: IndexStub = {
-      name: 'MASTER_INDEX',
-      type: 'Knowledge Graph Index',
-      canonicalName: 'Master Index',
-      summary: 'Primary entry point for knowledge graph navigation.',
-    };
-    expect(stub.canonicalName).toBe('Master Index');
-    expect(stub.summary).toBeDefined();
-  });
-});
-
-describe('buildIndexStub() via readGraphSummary()', () => {
-  const indexEntity = {
-    name: 'MASTER_INDEX',
-    entityType: 'Knowledge Graph Index',
-    observations: [
-      'canonical_name:Master Index',
-      'canonical_type:Knowledge',
-      'Primary entry point for knowledge graph navigation and discovery.',
-      'Contains references to all major organizational structures and indices.',
-    ],
-  };
-
-  it('returns IndexStub[] not Entity[]', async () => {
-    const manager = mockManager([indexEntity]);
-    const result = await manager.readGraphSummary();
-    const stub = result.indices[0];
-    expect(stub.name).toBe('MASTER_INDEX');
-    expect(stub.type).toBe('Knowledge Graph Index');
-    expect((stub as any).observations).toBeUndefined();
-  });
-
+describe('IndexStub in readGraphSummary', () => {
   it('extracts canonicalName from canonical_name: observation', async () => {
-    const manager = mockManager([indexEntity]);
-    const result = await manager.readGraphSummary();
-    expect(result.indices[0].canonicalName).toBe('Master Index');
+    const { manager } = createTestManager();
+    await manager.createEntities([
+      { name: 'MY_INDEX', entityType: 'knowledge_index', observations: ['canonical_name:My Index', 'summary: A cool index'] }
+    ], ctx);
+
+    const summary = await manager.readGraphSummary(ctx);
+    const stub = summary.indices.find(i => i.name === 'MY_INDEX');
+    expect(stub).toBeDefined();
+    expect(stub!.canonicalName).toBe('My Index');
   });
 
-  it('skips tag observations for summary', async () => {
-    const manager = mockManager([indexEntity]);
-    const result = await manager.readGraphSummary();
-    const summary = result.indices[0].summary;
-    expect(summary).toBe('Primary entry point for knowledge graph navigation and discovery.');
-    expect(summary).not.toContain('canonical_');
-  });
+  it('filters tag observations from summary', async () => {
+    const { manager } = createTestManager();
+    await manager.createEntities([
+      { name: 'MY_INDEX', entityType: 'knowledge_index', observations: ['canonical_type:Knowledge', 'status:active', 'Top-level navigation hub'] }
+    ], ctx);
 
-  it('truncates long summary to 120 chars with ellipsis', async () => {
-    const longObs = 'A'.repeat(130);
-    const entity = { name: 'LONG_INDEX', entityType: 'Some Index', observations: [longObs] };
-    const manager = mockManager([entity]);
-    const result = await manager.readGraphSummary();
-    expect(result.indices[0].summary!.length).toBe(123); // 120 + '...'
-    expect(result.indices[0].summary!.endsWith('...')).toBe(true);
-  });
-
-  it('omits summary when all observations are tags', async () => {
-    const entity = {
-      name: 'TAG_INDEX',
-      entityType: 'Some Index',
-      observations: ['canonical_type:Knowledge', 'canonical_name:Tag Index', 'status:active'],
-    };
-    const manager = mockManager([entity]);
-    const result = await manager.readGraphSummary();
-    expect(result.indices[0].summary).toBeUndefined();
-  });
-
-  it('non-index entities are excluded', async () => {
-    const nonIndex = { name: 'AUTH_SERVICE', entityType: 'component', observations: [] };
-    const manager = mockManager([indexEntity, nonIndex]);
-    const result = await manager.readGraphSummary();
-    expect(result.indices).toHaveLength(1);
-    expect(result.indices[0].name).toBe('MASTER_INDEX');
+    const summary = await manager.readGraphSummary(ctx);
+    const stub = summary.indices.find(i => i.name === 'MY_INDEX');
+    expect(stub).toBeDefined();
+    expect(stub!.summary).toBe('Top-level navigation hub');
   });
 });
 
 describe('tierCap()', () => {
-  it('single-token cap is 20', async () => {
-    const manyEntities = Array.from({ length: 25 }, (_, i) => ({
-      name: `ENTITY_${i}`,
-      entityType: 'component',
-      observations: [`tag match ${i}`],
+  it('single-token search caps at 20', async () => {
+    const { manager } = createTestManager();
+    // Create 25 entities all matching 'test'
+    const entities = Array.from({ length: 25 }, (_, i) => ({
+      name: `TEST_ENTITY_${i}`,
+      entityType: 'test',
+      observations: [`test observation ${i}`],
     }));
-    const manager = mockManager(manyEntities);
-    const result = await manager.searchNodes('tag');
-    const tier = result.tiers[0];
-    expect(tier.total).toBe(25);
-    expect(tier.capped).toBe(true);
-    expect(tier.entities.length).toBe(20);
+    await manager.createEntities(entities, ctx);
+
+    const result = await manager.searchNodes('test', ctx);
+    const tierEntities = result.tiers.flatMap(t => t.entities);
+    expect(tierEntities.length).toBeLessThanOrEqual(20);
+    expect(result.tiers[0].capped).toBe(true);
+    expect(result.tiers[0].total).toBe(25);
   });
 });

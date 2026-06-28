@@ -1,6 +1,6 @@
 {
   "name": "j5ed-knowledge-graph",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "A knowledge graph memory server for MCP with multi-agent tenant isolation, tiered search, index navigation, and three transport modes",
   "keywords": [
     "mcp",
@@ -32,6 +32,7 @@
     "dev": "ts-node --esm src/index.ts",
     "start": "node dist/index.js",
     "start:sse": "node dist/index.js --sse --port 3100",
+    "migrate": "node dist/migrations/migrate-ndjson.js",
     "start:http": "node dist/index.js --http --port 3100",
     "watch": "tsc --watch",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest",
@@ -41,6 +42,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.2",
+    "@types/better-sqlite3": "^7.6.13",
+    "better-sqlite3": "^12.11.1",
     "express": "^5.2.1"
   },
   "devDependencies": {

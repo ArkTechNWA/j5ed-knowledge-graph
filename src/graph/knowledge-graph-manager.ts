@@ -1,4 +1,4 @@
-import { StorageService } from '../persistence/storage.js';
+import { SqliteStorageService, EntityRow, ObservationRow, RelationRow } from '../persistence/sqlite-storage.js';
 import { config } from '../utils/config.js';
 import {
   AgentContext,
@@ -16,413 +16,358 @@ import {
 } from '../types/graph.js';
 
 /**
- * Simple async mutex — serializes access to a critical section.
- */
-class AsyncMutex {
-  private queue: Array<() => void> = [];
-  private locked = false;
-
-  async runExclusive<T>(fn: () => Promise<T>): Promise<T> {
-    await this.acquire();
-    try {
-      return await fn();
-    } finally {
-      this.release();
-    }
-  }
-
-  private acquire(): Promise<void> {
-    return new Promise<void>(resolve => {
-      if (!this.locked) {
-        this.locked = true;
-        resolve();
-      } else {
-        this.queue.push(resolve);
-      }
-    });
-  }
-
-  private release(): void {
-    if (this.queue.length > 0) {
-      const next = this.queue.shift()!;
-      next();
-    } else {
-      this.locked = false;
-    }
-  }
-}
-
-/**
- * Manages operations on the knowledge graph
+ * Manages operations on the knowledge graph backed by SQLite.
  */
 export class KnowledgeGraphManager {
-  private storageService: StorageService;
-  private writeLock = new AsyncMutex();
+  private storage: SqliteStorageService;
 
-  constructor(storageService?: StorageService) {
-    this.storageService = storageService || new StorageService();
+  constructor(storage: SqliteStorageService) {
+    this.storage = storage;
   }
 
+  // ── Tenant helpers ─────────────────────────────────────────────
+
+  private getAllowedAgents(agentContext?: AgentContext): string[] | undefined {
+    if (!agentContext) return undefined;
+    const agents = [agentContext.agentId];
+    const grants = config.agentReadGrants.get(agentContext.agentId);
+    if (grants) agents.push(...grants);
+    return agents;
+  }
+
+  private isEntityOwnedBy(entity: EntityRow, agentContext?: AgentContext): boolean {
+    if (!agentContext) return true;
+    const allowed = this.getAllowedAgents(agentContext)!;
+    if (!allowed.includes(entity.created_by)) return false;
+    if (agentContext.userId) {
+      return entity.user_id === null || entity.user_id === agentContext.userId;
+    }
+    return true;
+  }
+
+  // ── Entity → wire format ──────────────────────────────────────
+
+  private entityRowToEntity(row: EntityRow, observations: ObservationRow[]): Entity {
+    const obs: string[] = observations.map(o => o.content);
+    // Synthetic injection for wire compatibility
+    obs.push(`authored_by:${row.created_by}`);
+    obs.push(`authored_at:${row.created_at}`);
+    if (row.user_id) {
+      obs.push(`user_id:${row.user_id}`);
+    }
+    return { name: row.name, entityType: row.entity_type, observations: obs };
+  }
+
+  private relationRowToRelation(row: RelationRow): Relation {
+    return {
+      from: row.from_name!,
+      to: row.to_name!,
+      relationType: row.relation_type,
+    };
+  }
+
+  // ── Index detection ───────────────────────────────────────────
+
+  private isIndexEntity(entity: EntityRow | Entity): boolean {
+    const type = 'entity_type' in entity ? entity.entity_type : entity.entityType;
+    const name = entity.name;
+    return type.toLowerCase().includes('index') || name.endsWith('_INDEX');
+  }
+
+  // ── Write operations ──────────────────────────────────────────
+
   async createEntities(entities: Entity[], agentContext?: AgentContext): Promise<Entity[]> {
-    return this.writeLock.runExclusive(async () => {
-      const graph = await this.storageService.loadGraph();
+    return this.storage.transaction(() => {
+      const created: Entity[] = [];
 
-      const newEntities = entities.filter(
-        e => !graph.entities.some(existingEntity => existingEntity.name === e.name)
-      );
+      for (const input of entities) {
+        // Skip duplicates
+        if (this.storage.getEntityByName(input.name)) continue;
 
-      if (agentContext) {
-        for (const entity of newEntities) {
-          if (!entity.observations.some(o => o.startsWith('authored_by:'))) {
-            entity.observations.push(`authored_by:${agentContext.agentId}`);
-          }
-          if (agentContext.userId && !entity.observations.some(o => o.startsWith('user_id:'))) {
-            entity.observations.push(`user_id:${agentContext.userId}`);
-          }
-          entity.observations.push(`authored_at:${new Date().toISOString()}`);
+        const agentId = agentContext?.agentId || config.defaultAgentId;
+        const userId = agentContext?.userId || null;
+
+        const entityId = this.storage.createEntity(
+          input.name, input.entityType, agentId, userId
+        );
+
+        // Add observations (skip synthetic tags from input)
+        for (const obs of input.observations) {
+          if (this.isSyntheticObservation(obs)) continue;
+          this.storage.addObservation(entityId, obs, agentId, userId);
         }
+
+        // Read back for return value
+        const row = this.storage.getEntityById(entityId)!;
+        const liveObs = this.storage.getLiveObservations(entityId);
+        created.push(this.entityRowToEntity(row, liveObs));
       }
 
-      graph.entities.push(...newEntities);
-      await this.storageService.saveGraph(graph);
-      return newEntities;
+      return created;
     });
   }
 
   async createRelations(relations: Relation[], agentContext?: AgentContext): Promise<Relation[]> {
-    return this.writeLock.runExclusive(async () => {
-      const graph = await this.storageService.loadGraph();
+    return this.storage.transaction(() => {
+      const created: Relation[] = [];
+      const agentId = agentContext?.agentId || config.defaultAgentId;
 
-      const newRelations = relations.filter(
-        r => !graph.relations.some(
-          existingRelation =>
-            existingRelation.from === r.from &&
-            existingRelation.to === r.to &&
-            existingRelation.relationType === r.relationType
-        )
-      );
+      for (const input of relations) {
+        const fromEntity = this.storage.getEntityByName(input.from);
+        const toEntity = this.storage.getEntityByName(input.to);
+        if (!fromEntity || !toEntity) continue;
 
-      if (agentContext && newRelations.length > 0) {
+        // Skip duplicates
+        const existing = this.storage.findLiveRelation(fromEntity.id, toEntity.id, input.relationType);
+        if (existing) continue;
+
+        this.storage.createRelation(fromEntity.id, toEntity.id, input.relationType, agentId);
+        created.push(input);
+      }
+
+      if (agentContext && created.length > 0) {
         console.error(
-          `[AUDIT] agent=${agentContext.agentId} created ${newRelations.length} relation(s):`,
-          newRelations.map(r => `${r.from} → ${r.relationType} → ${r.to}`).join(', ')
+          `[AUDIT] agent=${agentContext.agentId} created ${created.length} relation(s):`,
+          created.map(r => `${r.from} → ${r.relationType} → ${r.to}`).join(', ')
         );
       }
 
-      graph.relations.push(...newRelations);
-      await this.storageService.saveGraph(graph);
-      return newRelations;
+      return created;
     });
   }
 
   async addObservations(inputs: ObservationInput[], agentContext?: AgentContext): Promise<ObservationResult[]> {
-    return this.writeLock.runExclusive(async () => {
-      const graph = await this.storageService.loadGraph();
+    return this.storage.transaction(() => {
       const results: ObservationResult[] = [];
+      const agentId = agentContext?.agentId || config.defaultAgentId;
+      const userId = agentContext?.userId || null;
 
       for (const input of inputs) {
-        const entity = graph.entities.find(e => e.name === input.entityName);
-
+        const entity = this.storage.getEntityByName(input.entityName);
         if (!entity) {
           throw new Error(`Entity with name ${input.entityName} not found`);
         }
 
-        const newObservations = input.contents.filter(
-          content => !entity.observations.includes(content)
-        );
-
-        if (agentContext && newObservations.length > 0) {
-          const authoredBy = `authored_by:${agentContext.agentId}`;
-          if (!entity.observations.includes(authoredBy)) {
-            newObservations.push(authoredBy);
-          }
-          if (agentContext.userId) {
-            const userId = `user_id:${agentContext.userId}`;
-            if (!entity.observations.includes(userId)) {
-              newObservations.push(userId);
-            }
-          }
-          newObservations.push(`authored_at:${new Date().toISOString()}`);
+        const added: string[] = [];
+        for (const content of input.contents) {
+          if (this.isSyntheticObservation(content)) continue;
+          // Skip duplicates
+          const existing = this.storage.findLiveObservation(entity.id, content);
+          if (existing) continue;
+          this.storage.addObservation(entity.id, content, agentId, userId);
+          added.push(content);
         }
 
-        entity.observations.push(...newObservations);
+        // Synthetic tags for wire compat in response
+        if (agentContext && added.length > 0) {
+          added.push(`authored_by:${agentId}`);
+          if (userId) added.push(`user_id:${userId}`);
+          added.push(`authored_at:${new Date().toISOString()}`);
+        }
 
-        results.push({
-          entityName: input.entityName,
-          addedObservations: newObservations
-        });
+        results.push({ entityName: input.entityName, addedObservations: added });
       }
 
-      await this.storageService.saveGraph(graph);
       return results;
     });
   }
 
   async deleteEntities(entityNames: string[], agentContext?: AgentContext): Promise<void> {
-    return this.writeLock.runExclusive(async () => {
-      const graph = await this.storageService.loadGraph();
-      const toDelete = new Set<string>();
+    this.storage.transaction(() => {
+      const agentId = agentContext?.agentId || 'system';
 
       for (const name of entityNames) {
-        const entity = graph.entities.find(e => e.name === name);
+        const entity = this.storage.getEntityByName(name);
         if (!entity) continue;
 
-        if (agentContext && !this.isOwnedBy(entity, agentContext)) {
+        if (agentContext && !this.isEntityOwnedBy(entity, agentContext)) {
           console.error(`[AUDIT] agent=${agentContext.agentId} BLOCKED delete of ${name} (not owned)`);
           continue;
         }
-        toDelete.add(name);
-        console.error(`[AUDIT] agent=${agentContext?.agentId || 'system'} deleted entity: ${name}`);
+
+        // Soft-delete: supersede all live observations and relations
+        const liveObs = this.storage.getLiveObservations(entity.id);
+        for (const obs of liveObs) {
+          this.storage.softDeleteObservation(obs.id, agentId);
+        }
+        this.storage.softDeleteRelationsForEntity(entity.id, agentId);
+
+        console.error(`[AUDIT] agent=${agentId} soft-deleted entity: ${name}`);
       }
-
-      graph.entities = graph.entities.filter(e => !toDelete.has(e.name));
-      graph.relations = graph.relations.filter(
-        r => !toDelete.has(r.from) && !toDelete.has(r.to)
-      );
-
-      await this.storageService.saveGraph(graph);
     });
   }
 
   async deleteObservations(deletions: ObservationDeletion[], agentContext?: AgentContext): Promise<void> {
-    return this.writeLock.runExclusive(async () => {
-      const graph = await this.storageService.loadGraph();
+    this.storage.transaction(() => {
+      const agentId = agentContext?.agentId || 'system';
 
       for (const deletion of deletions) {
-        const entity = graph.entities.find(e => e.name === deletion.entityName);
+        const entity = this.storage.getEntityByName(deletion.entityName);
         if (!entity) continue;
 
-        if (agentContext && !this.isOwnedBy(entity, agentContext)) {
+        if (agentContext && !this.isEntityOwnedBy(entity, agentContext)) {
           console.error(`[AUDIT] agent=${agentContext.agentId} BLOCKED observation delete on ${deletion.entityName}`);
           continue;
         }
 
-        entity.observations = entity.observations.filter(
-          observation => !deletion.observations.includes(observation)
-        );
+        for (const obsContent of deletion.observations) {
+          const obs = this.storage.findLiveObservation(entity.id, obsContent);
+          if (obs) {
+            this.storage.softDeleteObservation(obs.id, agentId);
+          }
+        }
       }
-
-      await this.storageService.saveGraph(graph);
     });
   }
 
   async deleteRelations(relations: Relation[], agentContext?: AgentContext): Promise<void> {
-    return this.writeLock.runExclusive(async () => {
-      const graph = await this.storageService.loadGraph();
+    this.storage.transaction(() => {
+      const agentId = agentContext?.agentId || 'system';
 
-      graph.relations = graph.relations.filter(
-        r => !relations.some(
-          delRelation => {
-            const matches = r.from === delRelation.from &&
-              r.to === delRelation.to &&
-              r.relationType === delRelation.relationType;
+      for (const rel of relations) {
+        const fromEntity = this.storage.getEntityByName(rel.from);
+        const toEntity = this.storage.getEntityByName(rel.to);
+        if (!fromEntity || !toEntity) continue;
 
-            if (matches && agentContext) {
-              const fromEntity = graph.entities.find(e => e.name === r.from);
-              if (fromEntity && !this.isOwnedBy(fromEntity, agentContext)) {
-                console.error(`[AUDIT] agent=${agentContext.agentId} BLOCKED relation delete: ${r.from} -> ${r.to}`);
-                return false;
-              }
-            }
-            return matches;
-          }
-        )
-      );
+        if (agentContext && !this.isEntityOwnedBy(fromEntity, agentContext)) {
+          console.error(`[AUDIT] agent=${agentContext.agentId} BLOCKED relation delete: ${rel.from} -> ${rel.to}`);
+          continue;
+        }
 
-      await this.storageService.saveGraph(graph);
+        const existing = this.storage.findLiveRelation(fromEntity.id, toEntity.id, rel.relationType);
+        if (existing) {
+          this.storage.softDeleteRelation(existing.id, agentId);
+        }
+      }
     });
   }
 
+  // ── Read operations ───────────────────────────────────────────
+
   async readGraph(agentContext?: AgentContext): Promise<KnowledgeGraph> {
-    const graph = await this.storageService.loadGraph();
-    if (!agentContext) return graph;
+    const allowedAgents = this.getAllowedAgents(agentContext);
+    const userId = agentContext?.userId;
 
-    const filteredEntities = graph.entities.filter(e => this.isOwnedBy(e, agentContext));
-    const ownedNames = new Set(filteredEntities.map(e => e.name));
-    const filteredRelations = graph.relations.filter(
-      r => ownedNames.has(r.from) && ownedNames.has(r.to)
-    );
+    const entityRows = this.storage.getAllEntities(allowedAgents, userId);
+    const entities: Entity[] = [];
 
-    return { entities: filteredEntities, relations: filteredRelations };
-  }
-
-  private isIndexEntity(entity: Entity): boolean {
-    return (
-      entity.entityType.toLowerCase().includes('index') ||
-      entity.name.endsWith('_INDEX')
-    );
-  }
-
-  private isOwnedBy(entity: Entity, agentContext?: AgentContext): boolean {
-    if (!agentContext) return true;
-
-    if (entity.observations.includes(`authored_by:${agentContext.agentId}`)) {
-      if (agentContext.userId) {
-        const entityUserId = entity.observations.find(o => o.startsWith('user_id:'));
-        if (!entityUserId) return true;
-        return entityUserId === `user_id:${agentContext.userId}`;
-      }
-      return true;
+    for (const row of entityRows) {
+      const obs = this.storage.getLiveObservations(row.id);
+      if (obs.length === 0 && agentContext) continue; // Skip entities with no live observations for tenant views
+      entities.push(this.entityRowToEntity(row, obs));
     }
 
-    const grants = config.agentReadGrants.get(agentContext.agentId);
-    if (grants) {
-      const authorTag = entity.observations.find(o => o.startsWith('authored_by:'));
-      if (authorTag) {
-        const sourceAgent = authorTag.slice(12);
-        if (grants.has(sourceAgent)) return true;
-      }
-    }
-    return false;
-  }
+    const entityNames = new Set(entities.map(e => e.name));
+    const entityIds = entityRows.filter(r => entityNames.has(r.name)).map(r => r.id);
+    const relationRows = this.storage.getLiveRelationsBetweenEntities(entityIds);
+    const relations = relationRows.map(r => this.relationRowToRelation(r));
 
-  private buildIndexStub(entity: Entity): IndexStub {
-    let canonicalName: string | undefined;
-    let summary: string | undefined;
-
-    for (const obs of entity.observations) {
-      const canonicalMatch = obs.match(/^canonical_name:(.+)$/);
-      if (canonicalMatch) {
-        canonicalName = canonicalMatch[1].trim();
-        continue;
-      }
-      if (/^[a-z_]+:[^\s]/.test(obs)) continue;
-      if (!summary) {
-        summary = obs.length > 120 ? obs.slice(0, 120) + '...' : obs;
-      }
-    }
-
-    return { name: entity.name, type: entity.entityType, canonicalName, summary };
+    return { entities, relations };
   }
 
   async readGraphSummary(agentContext?: AgentContext): Promise<GraphSummary> {
-    const graph = await this.storageService.loadGraph();
+    const allowedAgents = this.getAllowedAgents(agentContext);
+    const userId = agentContext?.userId;
 
-    const tenantEntities = agentContext
-      ? graph.entities.filter(e => this.isOwnedBy(e, agentContext))
-      : graph.entities;
-    const tenantEntityNames = new Set(tenantEntities.map(e => e.name));
-    const tenantRelations = agentContext
-      ? graph.relations.filter(r => tenantEntityNames.has(r.from) && tenantEntityNames.has(r.to))
-      : graph.relations;
+    const allEntities = this.storage.getAllEntities(allowedAgents, userId);
+    // Only count entities with live observations for tenant views
+    const visibleEntities = agentContext
+      ? allEntities.filter(e => this.storage.entityHasLiveObservations(e.id))
+      : allEntities;
 
-    const indices = tenantEntities.filter(e => this.isIndexEntity(e));
-    const indexNames = new Set(indices.map(e => e.name));
-    const indexRelations = tenantRelations.filter(
-      r => indexNames.has(r.from) && indexNames.has(r.to)
-    );
+    const indices = visibleEntities.filter(e => this.isIndexEntity(e));
+    const indexEntities: Entity[] = [];
+    for (const idx of indices) {
+      const obs = this.storage.getLiveObservations(idx.id);
+      indexEntities.push(this.entityRowToEntity(idx, obs));
+    }
+
+    const indexIds = indices.map(e => e.id);
+    const indexRelationRows = this.storage.getLiveRelationsBetweenEntities(indexIds);
+    const indexRelations = indexRelationRows.map(r => this.relationRowToRelation(r));
+
+    const totalRelations = this.storage.countLiveRelations(allowedAgents, userId);
 
     return {
       status: 'summary',
       reason: 'Returning indices as navigation layer. Use force=true for full graph.',
-      indices: indices.map(e => this.buildIndexStub(e)),
+      indices: indexEntities.map(e => this.buildIndexStub(e)),
       indexRelations,
       counts: {
-        total_entities: tenantEntities.length,
-        total_relations: tenantRelations.length,
-        indices_returned: indices.length
+        total_entities: visibleEntities.length,
+        total_relations: totalRelations,
+        indices_returned: indices.length,
       },
       drill_down: {
         specific_entity: "open_nodes(['entity_name'])",
         search: "search_nodes('query')",
-        full_graph: "read_graph({ force: true })"
-      }
+        full_graph: "read_graph({ force: true })",
+      },
     };
   }
 
-  private entityMatchesToken(entity: Entity, token: string): boolean {
-    return (
-      entity.name.toLowerCase().includes(token) ||
-      entity.entityType.toLowerCase().includes(token) ||
-      entity.observations.some(o => o.toLowerCase().includes(token))
-    );
-  }
+  async openNodes(names: string[], agentContext?: AgentContext): Promise<KnowledgeGraph> {
+    const entityRows = this.storage.getEntitiesByNames(names);
+    const filtered = agentContext
+      ? entityRows.filter(r => this.isEntityOwnedBy(r, agentContext))
+      : entityRows;
 
-  private scoreEntity(entity: Entity, tokens: string[]): number {
-    let score = 0;
-
-    if (this.isIndexEntity(entity)) {
-      score += 1000;
+    const entities: Entity[] = [];
+    for (const row of filtered) {
+      const obs = this.storage.getLiveObservations(row.id);
+      entities.push(this.entityRowToEntity(row, obs));
     }
 
-    const nameLower = entity.name.toLowerCase();
-    const typeLower = entity.entityType.toLowerCase();
+    const entityIds = filtered.map(r => r.id);
+    const hasIndex = filtered.some(e => this.isIndexEntity(e));
 
-    for (const token of tokens) {
-      if (nameLower.includes(token)) {
-        score += 30;
-      } else if (typeLower.includes(token)) {
-        score += 20;
-      } else if (entity.observations.some(o => o.toLowerCase().includes(token))) {
-        score += 10;
-      }
-    }
-
-    return score;
-  }
-
-  private buildStub(entity: Entity, tokens: string[]): EntityStub {
-    const nameLower = entity.name.toLowerCase();
-    const typeLower = entity.entityType.toLowerCase();
-    const matchedIn: Array<'name' | 'type' | 'observation'> = [];
-
-    for (const token of tokens) {
-      if (nameLower.includes(token) && !matchedIn.includes('name')) {
-        matchedIn.push('name');
-      }
-      if (typeLower.includes(token) && !matchedIn.includes('type')) {
-        matchedIn.push('type');
-      }
-      if (
-        entity.observations.some(o => o.toLowerCase().includes(token)) &&
-        !matchedIn.includes('observation')
-      ) {
-        matchedIn.push('observation');
-      }
-    }
-
-    const stub: EntityStub = {
-      name: entity.name,
-      type: entity.entityType,
-      matchedIn,
-    };
-
-    if (matchedIn.includes('observation') && !matchedIn.includes('name')) {
-      const matchingToken = tokens.find(t =>
-        entity.observations.some(o => o.toLowerCase().includes(t))
-      );
-      if (matchingToken) {
-        const matchingObs = entity.observations.find(o =>
-          o.toLowerCase().includes(matchingToken)
-        );
-        if (matchingObs) {
-          stub.snippet = matchingObs.length > 120
-            ? matchingObs.slice(0, 120) + '...'
-            : matchingObs;
+    let relations: Relation[];
+    if (hasIndex) {
+      // For index entities, also include inbound indexed_in relations
+      const betweenRows = this.storage.getLiveRelationsBetweenEntities(entityIds);
+      const allowedAgents = this.getAllowedAgents(agentContext);
+      const inboundRows = this.storage.getInboundRelations(entityIds, allowedAgents);
+      // Merge, dedup by relation id
+      const seen = new Set<number>();
+      const allRelRows: RelationRow[] = [];
+      for (const r of [...betweenRows, ...inboundRows]) {
+        if (!seen.has(r.id)) {
+          seen.add(r.id);
+          allRelRows.push(r);
         }
       }
+      relations = allRelRows.map(r => this.relationRowToRelation(r));
+    } else {
+      const relRows = this.storage.getLiveRelationsForEntities(entityIds);
+      relations = relRows.map(r => this.relationRowToRelation(r));
     }
 
-    return stub;
+    return { entities, relations };
   }
 
-  private tierCap(matchCount: number, totalTokens: number): number {
-    if (totalTokens <= 1) return 20;
-    return 10 + (matchCount - 1) * 5;
-  }
+  // ── Search ────────────────────────────────────────────────────
 
   async searchNodes(query: string, agentContext?: AgentContext): Promise<SearchResult> {
-    const graph = await this.storageService.loadGraph();
     const tokens = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+    const allowedAgents = this.getAllowedAgents(agentContext);
+    const userId = agentContext?.userId;
 
-    const searchableEntities = agentContext
-      ? graph.entities.filter(e => this.isOwnedBy(e, agentContext))
-      : graph.entities;
+    // Get all searchable entities
+    const allEntities = this.storage.getAllEntities(allowedAgents, userId);
+    const visibleEntities = agentContext
+      ? allEntities.filter(e => this.storage.entityHasLiveObservations(e.id))
+      : allEntities;
+
+    // Build Entity objects for scoring (reuse existing scoring logic)
+    const entityMap = new Map<string, Entity>();
+    for (const row of visibleEntities) {
+      const obs = this.storage.getLiveObservations(row.id);
+      entityMap.set(row.name, this.entityRowToEntity(row, obs));
+    }
 
     if (tokens.length <= 1) {
       const token = tokens[0] || '';
-      const matched = searchableEntities.filter(e => this.entityMatchesToken(e, token));
-
+      const matched = [...entityMap.values()].filter(e => this.entityMatchesToken(e, token));
       matched.sort((a, b) => this.scoreEntity(b, [token]) - this.scoreEntity(a, [token]));
       const cap = this.tierCap(1, 1);
       const capped = matched.slice(0, cap);
@@ -435,87 +380,158 @@ export class KnowledgeGraphManager {
           label: `matches "${token}"`,
           entities: capped.map(e => this.buildStub(e, [token])),
           total: matched.length,
-          capped: matched.length > cap
+          capped: matched.length > cap,
         }] : [],
-        totalMatches: matched.length
+        totalMatches: matched.length,
       };
     }
 
     const entityScores = new Map<string, number>();
-    for (const entity of searchableEntities) {
+    for (const entity of entityMap.values()) {
       let count = 0;
       for (const token of tokens) {
-        if (this.entityMatchesToken(entity, token)) {
-          count++;
-        }
+        if (this.entityMatchesToken(entity, token)) count++;
       }
-      if (count > 0) {
-        entityScores.set(entity.name, count);
-      }
+      if (count > 0) entityScores.set(entity.name, count);
     }
 
     const tierMap = new Map<number, Entity[]>();
-    for (const entity of searchableEntities) {
-      const score = entityScores.get(entity.name);
-      if (score) {
-        if (!tierMap.has(score)) tierMap.set(score, []);
-        tierMap.get(score)!.push(entity);
-      }
+    for (const [name, score] of entityScores) {
+      if (!tierMap.has(score)) tierMap.set(score, []);
+      tierMap.get(score)!.push(entityMap.get(name)!);
     }
 
     const tiers: SearchTier[] = [];
-    const sortedCounts = [...tierMap.keys()].sort((a, b) => a - b);
-
-    for (const count of sortedCounts) {
+    for (const count of [...tierMap.keys()].sort((a, b) => a - b)) {
       const tierEntities = tierMap.get(count)!;
       tierEntities.sort((a, b) => this.scoreEntity(b, tokens) - this.scoreEntity(a, tokens));
-
       const cap = this.tierCap(count, tokens.length);
       const capped = tierEntities.slice(0, cap);
 
-      const label = count === tokens.length
-        ? `matches all ${count} tokens`
-        : `matches ${count} of ${tokens.length} tokens`;
-
       tiers.push({
         matchCount: count,
-        label,
+        label: count === tokens.length
+          ? `matches all ${count} tokens`
+          : `matches ${count} of ${tokens.length} tokens`,
         entities: capped.map(e => this.buildStub(e, tokens)),
         total: tierEntities.length,
-        capped: tierEntities.length > cap
+        capped: tierEntities.length > cap,
       });
     }
 
-    return {
-      query,
-      tokens,
-      tiers,
-      totalMatches: entityScores.size
-    };
+    return { query, tokens, tiers, totalMatches: entityScores.size };
   }
 
-  async openNodes(names: string[], agentContext?: AgentContext): Promise<KnowledgeGraph> {
-    const graph = await this.storageService.loadGraph();
+  // ── Search internals (preserved from original) ────────────────
 
-    const filteredEntities = graph.entities.filter(
-      e => names.includes(e.name) && this.isOwnedBy(e, agentContext)
+  private entityMatchesToken(entity: Entity, token: string): boolean {
+    return (
+      entity.name.toLowerCase().includes(token) ||
+      entity.entityType.toLowerCase().includes(token) ||
+      entity.observations.some(o => o.toLowerCase().includes(token))
     );
+  }
 
-    const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
-    const hasIndex = filteredEntities.some(e => this.isIndexEntity(e));
+  private scoreEntity(entity: Entity, tokens: string[]): number {
+    let score = 0;
+    if (this.isIndexEntity(entity)) score += 1000;
 
-    const filteredRelations = graph.relations.filter(r => {
-      if (filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to)) return true;
-      if (hasIndex && filteredEntityNames.has(r.to) && this.isOwnedBy(
-        graph.entities.find(e => e.name === r.from) || { observations: [] } as any,
-        agentContext
-      )) return true;
-      return false;
-    });
+    const nameLower = entity.name.toLowerCase();
+    const typeLower = entity.entityType.toLowerCase();
 
-    return {
-      entities: filteredEntities,
-      relations: filteredRelations
-    };
+    for (const token of tokens) {
+      if (nameLower.includes(token)) score += 30;
+      else if (typeLower.includes(token)) score += 20;
+      else if (entity.observations.some(o => o.toLowerCase().includes(token))) score += 10;
+    }
+    return score;
+  }
+
+  private buildStub(entity: Entity, tokens: string[]): EntityStub {
+    const nameLower = entity.name.toLowerCase();
+    const typeLower = entity.entityType.toLowerCase();
+    const matchedIn: Array<'name' | 'type' | 'observation'> = [];
+
+    for (const token of tokens) {
+      if (nameLower.includes(token) && !matchedIn.includes('name')) matchedIn.push('name');
+      if (typeLower.includes(token) && !matchedIn.includes('type')) matchedIn.push('type');
+      if (entity.observations.some(o => o.toLowerCase().includes(token)) && !matchedIn.includes('observation'))
+        matchedIn.push('observation');
+    }
+
+    const stub: EntityStub = { name: entity.name, type: entity.entityType, matchedIn };
+
+    if (matchedIn.includes('observation') && !matchedIn.includes('name')) {
+      const matchingToken = tokens.find(t => entity.observations.some(o => o.toLowerCase().includes(t)));
+      if (matchingToken) {
+        const matchingObs = entity.observations.find(o => o.toLowerCase().includes(matchingToken));
+        if (matchingObs) {
+          stub.snippet = matchingObs.length > 120 ? matchingObs.slice(0, 120) + '...' : matchingObs;
+        }
+      }
+    }
+
+    return stub;
+  }
+
+  private buildIndexStub(entity: Entity): IndexStub {
+    let canonicalName: string | undefined;
+    let summary: string | undefined;
+
+    for (const obs of entity.observations) {
+      const canonicalMatch = obs.match(/^canonical_name:(.+)$/);
+      if (canonicalMatch) { canonicalName = canonicalMatch[1].trim(); continue; }
+      if (/^[a-z_]+:[^\s]/.test(obs)) continue;
+      if (!summary) {
+        summary = obs.length > 120 ? obs.slice(0, 120) + '...' : obs;
+      }
+    }
+
+    return { name: entity.name, type: entity.entityType, canonicalName, summary };
+  }
+
+  private tierCap(matchCount: number, totalTokens: number): number {
+    if (totalTokens <= 1) return 20;
+    return 10 + (matchCount - 1) * 5;
+  }
+
+  // ── Wiki-mode operations (new) ────────────────────────────────
+
+  async entityHistory(entityName: string): Promise<ObservationRow[]> {
+    return this.storage.getEntityHistory(entityName);
+  }
+
+  async changesToMine(agentId: string): Promise<any[]> {
+    return this.storage.getChangesToMine(agentId);
+  }
+
+  async addComment(observationId: number, content: string, agentContext?: AgentContext): Promise<number> {
+    const authoredBy = agentContext?.agentId || config.defaultAgentId;
+    return this.storage.addComment(observationId, content, authoredBy);
+  }
+
+  async getObservationComments(observationId: number): Promise<any[]> {
+    return this.storage.getComments(observationId);
+  }
+
+  async supersedeObservation(
+    observationId: number,
+    newContent: string,
+    rationale: string,
+    agentContext?: AgentContext
+  ): Promise<number> {
+    const authoredBy = agentContext?.agentId || config.defaultAgentId;
+    const userId = agentContext?.userId || null;
+    return this.storage.supersedeObservation(observationId, newContent, authoredBy, rationale, userId);
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────
+
+  private isSyntheticObservation(obs: string): boolean {
+    return (
+      obs.startsWith('authored_by:') ||
+      obs.startsWith('authored_at:') ||
+      obs.startsWith('user_id:')
+    );
   }
 }
