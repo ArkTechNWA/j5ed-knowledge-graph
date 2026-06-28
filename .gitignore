@@ -6,6 +6,9 @@ dist/
 
 # Memory files (each instance has its own)
 memory.json
+*.db
+*.db-wal
+*.db-shm
 *.bak.*
 
 # Logs

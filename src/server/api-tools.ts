@@ -178,3 +178,65 @@ export const apiTools = [
     },
   },
 ];
+
+// Wiki-mode tools — new in SQLite backend
+export const wikiTools = [
+  {
+    name: "entity_history",
+    description: "Get the full mutation timeline for an entity — all observations ever written (live and superseded), ordered chronologically. Shows who changed what, when, and why.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        entityName: { type: "string", description: "The name of the entity to get history for" },
+      },
+      required: ["entityName"],
+    },
+  },
+  {
+    name: "changes_to_mine",
+    description: "Show observations you wrote that another agent changed. Returns the original content, the replacement, who changed it, when, and the rationale they provided.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    name: "comment",
+    description: "Add a comment to an observation without modifying it. Comments are append-only annotations — they do not affect the observation's content or lifecycle.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        observationId: { type: "number", description: "The ID of the observation to comment on" },
+        content: { type: "string", description: "The comment content" },
+      },
+      required: ["observationId", "content"],
+    },
+  },
+  {
+    name: "observation_comments",
+    description: "List all comments on a specific observation, ordered chronologically.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        observationId: { type: "number", description: "The ID of the observation to get comments for" },
+      },
+      required: ["observationId"],
+    },
+  },
+  {
+    name: "supersede",
+    description: "Replace an observation with new content, preserving the full version chain. The old observation is soft-deleted with a rationale. The new observation links back via previous_version_id. Use this for 'change this to that' — not for removing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        observationId: { type: "number", description: "The ID of the observation to supersede" },
+        newContent: { type: "string", description: "The replacement observation content" },
+        rationale: { type: "string", description: "Why this observation is being replaced" },
+      },
+      required: ["observationId", "newContent", "rationale"],
+    },
+  },
+];
+
+// Combined tools list
+export const allTools = [...apiTools, ...wikiTools];
