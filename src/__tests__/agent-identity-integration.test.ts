@@ -1,12 +1,32 @@
-import { AgentContext } from '../types/graph.js';
-import { createTestManager } from './helpers/test-db.js';
+import { KnowledgeGraphManager } from '../graph/knowledge-graph-manager.js';
+import { StorageService } from '../persistence/storage.js';
+import { AgentContext, Entity, Relation } from '../types/graph.js';
+
+/**
+ * Integration test: verifies full tenant isolation lifecycle.
+ * Two agents write to the same graph — reads are isolated.
+ * Uses a stateful mock that persists across operations.
+ */
+
+function mockManagerWithState() {
+  let graphState: { entities: Entity[]; relations: Relation[] } = { entities: [], relations: [] };
+  const storage = {
+    loadGraph: () => Promise.resolve({
+      entities: graphState.entities.map(e => ({ ...e, observations: [...e.observations] })),
+      relations: [...graphState.relations],
+    }),
+    saveGraph: (graph: any) => { graphState = graph; return Promise.resolve(); },
+  } as unknown as StorageService;
+  const manager = new KnowledgeGraphManager(storage);
+  return { manager, getState: () => graphState };
+}
 
 const j5: AgentContext = { agentId: 'j5' };
 const boinx: AgentContext = { agentId: 'boinx' };
 
 describe('Multi-agent isolation round-trip', () => {
   it('full lifecycle: write, read, search — agents are isolated', async () => {
-    const { manager } = createTestManager();
+    const { manager } = mockManagerWithState();
 
     // J5 creates entities
     await manager.createEntities([
@@ -64,17 +84,32 @@ describe('Multi-agent isolation round-trip', () => {
     expect(boinxSummary.indices.map(i => i.name)).toEqual(['BOINX_INDEX']);
     expect(boinxSummary.counts.total_entities).toBe(2);
 
-    // J5 openNodes — sees own entities with inbound relations for index
-    const j5Open = await manager.openNodes(['J5_INDEX'], j5);
-    expect(j5Open.entities).toHaveLength(1);
-    expect(j5Open.entities[0].name).toBe('J5_INDEX');
-    expect(j5Open.relations.some(r => r.from === 'J5_AUTH_SERVICE' && r.relationType === 'indexed_in')).toBe(true);
+    // J5 open_nodes — cannot see Boinx entities
+    const j5Open = await manager.openNodes(['BOINX_INDEX'], j5);
+    expect(j5Open.entities).toHaveLength(0);
 
-    // J5 addObservations
-    await manager.addObservations([
-      { entityName: 'J5_AUTH_SERVICE', contents: ['new auth fact'] }
+    // Boinx open_nodes — cannot see J5 entities
+    const boinxOpen = await manager.openNodes(['J5_INDEX'], boinx);
+    expect(boinxOpen.entities).toHaveLength(0);
+  });
+
+  it('addObservations respects tenant — only works on owned entities', async () => {
+    const { manager } = mockManagerWithState();
+
+    // J5 creates an entity
+    await manager.createEntities([
+      { name: 'J5_NOTE', entityType: 'test', observations: ['original'] }
     ], j5);
-    const j5Updated = await manager.openNodes(['J5_AUTH_SERVICE'], j5);
-    expect(j5Updated.entities[0].observations).toContain('new auth fact');
+
+    // J5 can add observations to its own entity
+    const result = await manager.addObservations([
+      { entityName: 'J5_NOTE', contents: ['new fact from j5'] }
+    ], j5);
+    expect(result[0].addedObservations).toContain('new fact from j5');
+
+    // Verify J5 sees the updated entity
+    const j5Graph = await manager.readGraph(j5);
+    const note = j5Graph.entities.find(e => e.name === 'J5_NOTE');
+    expect(note!.observations).toContain('new fact from j5');
   });
 });

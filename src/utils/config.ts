@@ -55,9 +55,7 @@ export const parseReadGrants = (raw: string | undefined): Map<string, Set<string
  * Configuration object for the application
  */
 export interface Config {
-  /** Path to the SQLite database file */
-  dbPath: string;
-  /** Path to the legacy NDJSON memory file (migration source only) */
+  /** Path to the memory file for storage */
   memoryFilePath: string;
   /** Default agent identity when no X-Agent-Id header is provided */
   defaultAgentId: string;
@@ -74,22 +72,16 @@ export interface Config {
  */
 export const loadConfig = (): Config => {
   const defaultMemoryPath = path.join(getCurrentDir(), 'memory.json');
-  const defaultDbPath = path.join(getCurrentDir(), 'memory.db');
 
   let memoryFilePath = process.env.MEMORY_FILE_PATH || defaultMemoryPath;
+
   if (memoryFilePath && !path.isAbsolute(memoryFilePath)) {
     memoryFilePath = path.join(getCurrentDir(), memoryFilePath);
-  }
-
-  let dbPath = process.env.DB_PATH || defaultDbPath;
-  if (dbPath && !path.isAbsolute(dbPath)) {
-    dbPath = path.join(getCurrentDir(), dbPath);
   }
 
   const agentCredentials = parseCredentials(process.env.AGENT_CREDENTIALS);
 
   return {
-    dbPath,
     memoryFilePath,
     defaultAgentId: process.env.DEFAULT_AGENT_ID || 'default',
     agentCredentials,
