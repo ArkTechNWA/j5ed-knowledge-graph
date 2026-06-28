@@ -13,7 +13,8 @@ import { randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 
 import { KnowledgeGraphManager } from "./graph/knowledge-graph-manager.js";
-import { apiTools } from "./server/api-tools.js";
+import { SqliteStorageService } from "./persistence/sqlite-storage.js";
+import { allTools } from "./server/api-tools.js";
 import { Entity, Relation, ObservationInput, ObservationDeletion, AgentContext } from "./types/graph.js";
 import { config } from "./utils/config.js";
 import pkg from '../package.json' with { type: 'json' };
@@ -63,8 +64,9 @@ const useHTTP = args.includes('--http');
 const portIndex = args.indexOf('--port');
 const port = portIndex !== -1 ? parseInt(args[portIndex + 1], 10) : 3100;
 
-// Create knowledge graph manager
-const knowledgeGraphManager = new KnowledgeGraphManager();
+// Create SQLite storage and knowledge graph manager
+const storage = new SqliteStorageService(config.dbPath);
+const knowledgeGraphManager = new KnowledgeGraphManager(storage);
 
 /**
  * Create and configure an MCP server instance with tool handlers
@@ -83,7 +85,7 @@ function createMCPServer(agentContext: AgentContext): Server {
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return { tools: apiTools };
+    return { tools: allTools };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -131,19 +133,19 @@ function createMCPServer(agentContext: AgentContext): Server {
         case "delete_entities":
           await knowledgeGraphManager.deleteEntities(ensureArray<string>(args.entityNames), agentContext);
           return {
-            content: [{ type: "text", text: "Entities deleted successfully" }]
+            content: [{ type: "text", text: "Entities soft-deleted successfully" }]
           };
 
         case "delete_observations":
           await knowledgeGraphManager.deleteObservations(ensureArray<ObservationDeletion>(args.deletions), agentContext);
           return {
-            content: [{ type: "text", text: "Observations deleted successfully" }]
+            content: [{ type: "text", text: "Observations soft-deleted successfully" }]
           };
 
         case "delete_relations":
           await knowledgeGraphManager.deleteRelations(ensureArray<Relation>(args.relations), agentContext);
           return {
-            content: [{ type: "text", text: "Relations deleted successfully" }]
+            content: [{ type: "text", text: "Relations soft-deleted successfully" }]
           };
 
         case "read_graph": {
@@ -178,6 +180,68 @@ function createMCPServer(agentContext: AgentContext): Server {
             }]
           };
 
+        case "entity_history":
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify(
+                await knowledgeGraphManager.entityHistory(args.entityName as string),
+                null, 2
+              )
+            }]
+          };
+
+        case "changes_to_mine":
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify(
+                await knowledgeGraphManager.changesToMine(agentContext.agentId),
+                null, 2
+              )
+            }]
+          };
+
+        case "comment":
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                commentId: await knowledgeGraphManager.addComment(
+                  args.observationId as number,
+                  args.content as string,
+                  agentContext
+                )
+              }, null, 2)
+            }]
+          };
+
+        case "observation_comments":
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify(
+                await knowledgeGraphManager.getObservationComments(args.observationId as number),
+                null, 2
+              )
+            }]
+          };
+
+        case "supersede":
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                newObservationId: await knowledgeGraphManager.supersedeObservation(
+                  args.observationId as number,
+                  args.newContent as string,
+                  args.rationale as string,
+                  agentContext
+                )
+              }, null, 2)
+            }]
+          };
+
         default:
           throw new Error(`Unknown tool: ${name}`);
       }
@@ -192,7 +256,7 @@ function createMCPServer(agentContext: AgentContext): Server {
 
 async function startStdio() {
   console.error(`j5ed-knowledge-graph v${pkg.version}`);
-  console.error(`Memory file path: ${config.memoryFilePath}`);
+  console.error(`Database: ${config.dbPath}`);
 
   const server = createMCPServer({ agentId: config.defaultAgentId });
   const transport = new StdioServerTransport();
@@ -203,7 +267,7 @@ async function startStdio() {
 
 async function startSSE() {
   console.error(`j5ed-knowledge-graph v${pkg.version}`);
-  console.error(`Memory file path: ${config.memoryFilePath}`);
+  console.error(`Database: ${config.dbPath}`);
 
   const app = express();
   const sessions = new Map<string, { transport: SSEServerTransport; server: Server }>();
@@ -259,9 +323,10 @@ async function startSSE() {
       name: 'j5ed-knowledge-graph',
       version: pkg.version,
       activeSessions: sessions.size,
-      memoryPath: config.memoryFilePath,
+      dbPath: config.dbPath,
       defaultAgentId: config.defaultAgentId,
-      tenantIsolation: true
+      tenantIsolation: true,
+      storage: 'sqlite'
     });
   });
 
@@ -275,7 +340,7 @@ async function startSSE() {
 
 async function startHTTP() {
   console.error(`j5ed-knowledge-graph v${pkg.version}`);
-  console.error(`Memory file path: ${config.memoryFilePath}`);
+  console.error(`Database: ${config.dbPath}`);
 
   const app = express();
   app.use(express.json());
@@ -353,9 +418,10 @@ async function startHTTP() {
       version: pkg.version,
       transport: 'streamable-http',
       activeSessions: sessions.size,
-      memoryPath: config.memoryFilePath,
+      dbPath: config.dbPath,
       defaultAgentId: config.defaultAgentId,
-      tenantIsolation: true
+      tenantIsolation: true,
+      storage: 'sqlite'
     });
   });
 
