@@ -1,4 +1,4 @@
-# Knowledge Graph Usage Guide
+# j5-knowledge-graph — Core Usage
 
 Three primitives: **Entities** (named nodes with observations), **Observations** (versioned facts on entities), **Relations** (directed typed edges between entities). Storage is SQLite with WAL mode — crash-safe, concurrent reads, FTS5 full-text search.
 
@@ -18,18 +18,6 @@ Three primitives: **Entities** (named nodes with observations), **Observations**
 | `delete_observations(deletions)` | Soft-delete specific observations | Confirmation |
 | `delete_relations(relations)` | Soft-delete specific relations | Confirmation |
 | `read_graph({ force: true })` | Full graph dump | Everything. Use sparingly. |
-
-## Wiki-Mode Tools
-
-These tools enable version tracking, cross-agent accountability, and annotation.
-
-| Tool | Purpose | Returns |
-|------|---------|---------|
-| `entity_history(entityName)` | Full mutation timeline — all observations ever written (live + superseded) | Chronological observation records with version, author, timestamps |
-| `changes_to_mine()` | Observations you wrote that another agent changed | Original content, replacement, who changed it, rationale |
-| `supersede(observationId, newContent, rationale)` | Replace an observation with a new version, preserving the chain | New observation ID |
-| `comment(observationId, content)` | Annotate an observation without modifying it | Comment ID |
-| `observation_comments(observationId)` | List all comments on an observation | Chronological comment records |
 
 ## Examples
 
@@ -91,44 +79,6 @@ add_observations({ observations: [{
 </example>
 
 <example>
-Correcting an observation with an audit trail:
-```
-// First, find the observation ID via entity_history
-entity_history({ entityName: "AUTH_SERVICE" })
-// Returns all observations with IDs. Find the one to correct.
-
-// Then supersede it with rationale
-supersede({
-  observationId: 42,
-  newContent: "OAuth2 PKCE flow added 2025-03-15 — replaces legacy implicit grant",
-  rationale: "Original observation was missing context about what it replaced"
-})
-```
-The old observation stays in history with `superseded_at` set. The new one links back via `previous_version_id`.
-</example>
-
-<example>
-Checking what happened to an entity over time:
-```
-entity_history({ entityName: "KRONOS_SERVER" })
-```
-Returns every observation ever written — live and superseded — in chronological order. Shows who wrote what, when, and if superseded, who changed it and why.
-</example>
-
-<example>
-Annotating without modifying:
-```
-comment({
-  observationId: 42,
-  content: "This may be outdated after the March migration"
-})
-
-observation_comments({ observationId: 42 })
-```
-Comments are append-only. They don't affect the observation's content or lifecycle.
-</example>
-
-<example>
 Soft-deleting an observation (it disappears from live views but stays in history):
 ```
 delete_observations({ deletions: [{
@@ -137,14 +87,6 @@ delete_observations({ deletions: [{
 }]})
 ```
 The observation gets `superseded_at` stamped. `open_nodes` won't show it. `entity_history` still will.
-</example>
-
-<example>
-Checking if another agent changed your work:
-```
-changes_to_mine()
-```
-Returns every case where another agent superseded an observation you authored, with the replacement content and their rationale.
 </example>
 
 ## Progressive Disclosure
@@ -173,8 +115,6 @@ Index entities are pure sink nodes — all inbound, zero outbound. The `indexed_
 | Claiming "I searched thoroughly" | Must include a graph search or it's not thorough |
 | User says "last time", "remember when" | The graph IS cross-session memory. Check it. |
 | User says "what's the status of" | Open the relevant project/index entity |
-| Need to understand how something evolved | `entity_history(entityName)` for the full timeline |
-| Suspect stale data in the graph | `entity_history` shows when each observation was written and by whom |
 
 ## Write Protocol
 
@@ -185,9 +125,6 @@ Index entities are pure sink nodes — all inbound, zero outbound. The `indexed_
 2. Add `canonical_type:<Value>` observation immediately
 3. Add `indexed_in` relation to the appropriate index
 4. Do NOT add `authored_by` or `authored_at` — injected automatically
-
-### When correcting:
-Use `supersede` instead of delete + recreate. The version chain preserves the rationale for the change. Future sessions can see what was believed before and why it changed.
 
 ### When removing:
 Use `delete_observations` or `delete_entities`. The data is soft-deleted — gone from live views, preserved in history. No data is destroyed.
@@ -212,8 +149,6 @@ Relations are directed: `from → relationType → to` must read as an active se
 ## Multi-Agent Provenance
 
 When multiple agents share a graph, each write is tagged with the authoring agent's identity. Agent read grants control visibility — agents see their own entities plus those from granted agents. Configure via `AGENT_CREDENTIALS` and `AGENT_READ_GRANTS` environment variables.
-
-Use `changes_to_mine()` to see when another agent has modified your observations. The rationale field explains why.
 
 ## Configuration
 
