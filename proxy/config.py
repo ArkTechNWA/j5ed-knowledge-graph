@@ -32,4 +32,4 @@ LOG_PATH = os.environ.get("AMBIENT_LOG_PATH",
     str(Path.home() / ".ambient-recall/log.jsonl"))
 
 # Server
-PROXY_PORT = int(os.environ.get("AMBIENT_PROXY_PORT", "8787"))
+PROXY_PORT = int(os.environ.get("AMBIENT_PROXY_PORT", "8780"))
