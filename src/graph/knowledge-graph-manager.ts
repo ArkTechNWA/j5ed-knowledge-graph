@@ -1,3 +1,4 @@
+import { EventEmitter } from 'events';
 import { executeHooks } from '../hooks/write-hooks.js';
 import { SqliteStorageService, EntityRow, ObservationRow, RelationRow } from '../persistence/sqlite-storage.js';
 import { config } from '../utils/config.js';
@@ -18,14 +19,50 @@ import {
   WriteEvent
 } from '../types/graph.js';
 
+// ── Typed events for embedding and external consumers ──────────
+export interface ObservationAddedEvent {
+  observationId: number;
+  entityId: number;
+  entityName: string;
+  content: string;
+  authoredBy: string;
+}
+
+export interface ObservationSupersededEvent {
+  oldId: number;
+  newId: number;
+  newContent: string;
+  entityId: number;
+  entityName: string;
+  authoredBy: string;
+}
+
+export interface ObservationDeletedEvent {
+  observationId: number;
+  entityName: string;
+}
+
+export interface EntityDeletedEvent {
+  entityName: string;
+  observationIds: number[];
+}
+
+export type KGEventMap = {
+  'observation:added': [ObservationAddedEvent];
+  'observation:superseded': [ObservationSupersededEvent];
+  'observation:deleted': [ObservationDeletedEvent];
+  'entity:deleted': [EntityDeletedEvent];
+};
+
 /**
  * Manages operations on the knowledge graph backed by SQLite.
  */
-export class KnowledgeGraphManager {
+export class KnowledgeGraphManager extends EventEmitter<KGEventMap> {
   private storage: SqliteStorageService;
   private hooks: WriteHook[];
 
   constructor(storage: SqliteStorageService, hooks?: WriteHook[]) {
+    super();
     this.storage = storage;
     this.hooks = hooks || [];
   }
@@ -175,13 +212,15 @@ export class KnowledgeGraphManager {
         }
 
         const added: string[] = [];
+        const addedIds: Array<{ obsId: number; content: string; entityId: number; entityName: string }> = [];
         for (const content of input.contents) {
           if (this.isSyntheticObservation(content)) continue;
           // Skip duplicates
           const existing = this.storage.findLiveObservation(entity.id, content);
           if (existing) continue;
-          this.storage.addObservation(entity.id, content, agentId, userId);
+          const obsId = this.storage.addObservation(entity.id, content, agentId, userId);
           added.push(content);
+          addedIds.push({ obsId, content, entityId: entity.id, entityName: input.entityName });
         }
 
         // Synthetic tags for wire compat in response
@@ -197,6 +236,21 @@ export class KnowledgeGraphManager {
       return results;
     });
 
+    // Collect all added observation IDs from the transaction
+    const allAddedIds: Array<{ obsId: number; content: string; entityId: number; entityName: string }> = [];
+    // Re-query to get IDs (transaction already committed, IDs are stable)
+    for (const input of inputs) {
+      const entity = this.storage.getEntityByName(input.entityName);
+      if (!entity) continue;
+      for (const content of input.contents) {
+        if (this.isSyntheticObservation(content)) continue;
+        const obs = this.storage.findLiveObservation(entity.id, content);
+        if (obs) {
+          allAddedIds.push({ obsId: obs.id, content, entityId: entity.id, entityName: input.entityName });
+        }
+      }
+    }
+
     const updatedNames = result.filter(r => r.addedObservations.length > 0).map(r => r.entityName);
     if (updatedNames.length > 0) {
       executeHooks({
@@ -204,6 +258,18 @@ export class KnowledgeGraphManager {
         entityTypes: [],
         operation: 'update',
       }, this.hooks);
+    }
+
+    // Emit events for embedding consumers
+    const agentId = inputs.length > 0 ? (agentContext?.agentId || config.defaultAgentId) : '';
+    for (const added of allAddedIds) {
+      this.emit('observation:added', {
+        observationId: added.obsId,
+        entityId: added.entityId,
+        entityName: added.entityName,
+        content: added.content,
+        authoredBy: agentId,
+      });
     }
 
     return result;
@@ -589,10 +655,21 @@ export class KnowledgeGraphManager {
   ): Promise<number> {
     const authoredBy = agentContext?.agentId || config.defaultAgentId;
     const userId = agentContext?.userId || null;
+    const old = this.storage.getObservationById(observationId);
+    const entityName = old ? (this.storage.getEntityById(old.entity_id)?.name || '') : '';
+    const entityId = old?.entity_id || 0;
+
     const newId = this.storage.supersedeObservation(observationId, newContent, authoredBy, rationale, userId);
 
-    // Fire hooks — we don't easily know the entity name here, so skip for now
-    // The observation-level supersede is a low-frequency operation
+    // Emit event for embedding consumers
+    this.emit('observation:superseded', {
+      oldId: observationId,
+      newId,
+      newContent,
+      entityId,
+      entityName,
+      authoredBy,
+    });
 
     return newId;
   }

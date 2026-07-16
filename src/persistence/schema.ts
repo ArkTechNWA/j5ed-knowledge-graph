@@ -160,3 +160,20 @@ export const ALL_DDL = [
   CREATE_BOOT_FLAG_TABLE,
   CREATE_BOOT_FLAG_TRIGGERS,
 ];
+
+// ── Vector embeddings (sqlite-vec) ────────────────────────────────
+// Optional: only created when EMBED_ENABLED=true and sqlite-vec loads.
+// NOT in ALL_DDL — executed conditionally after extension loads.
+
+export function createVecObservationsDDL(dim: number): string {
+  return `CREATE VIRTUAL TABLE IF NOT EXISTS vec_observations USING vec0(embedding float[${dim}])`;
+}
+
+export const CREATE_VEC_METADATA = `
+  CREATE TABLE IF NOT EXISTS vec_metadata (
+    observation_id  INTEGER PRIMARY KEY,
+    entity_name     TEXT    NOT NULL,
+    authored_by     TEXT    NOT NULL,
+    embedded_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  )
+`;
