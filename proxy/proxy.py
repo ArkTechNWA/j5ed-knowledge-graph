@@ -323,6 +323,7 @@ async def proxy_request(request: Request, path: str):
     url = f"/{path}"
     headers = dict(request.headers)
     headers.pop("host", None)
+    headers.pop("content-length", None)  # recalculated by httpx after body modification
 
     # Forward API key
     if cfg.ANTHROPIC_API_KEY and "x-api-key" not in headers:
