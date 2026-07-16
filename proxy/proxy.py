@@ -116,7 +116,7 @@ def retrieve_memories(query_embedding: bytes, k: int) -> list[dict]:
             "content": r[2],
             "entity_name": r[3],
             "authored_by": r[4],
-            "similarity": 1.0 - r[1],  # cosine distance → similarity
+            "similarity": 1.0 - (r[1] ** 2) / 2.0,  # L2 distance → cosine similarity (for unit-normalized vectors)
         }
         for r in rows
     ]
