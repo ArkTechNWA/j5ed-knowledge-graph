@@ -1,4 +1,5 @@
 import path from 'path';
+import { WriteHook } from '../types/graph.js';
 import { fileURLToPath } from 'url';
 
 /**
@@ -67,7 +68,27 @@ export interface Config {
   authRequired: boolean;
   /** Map of readerId -> Set<sourceId> for cross-agent read grants */
   agentReadGrants: Map<string, Set<string>>;
+  /** Post-write hooks triggered by entity mutations */
+  writeHooks: WriteHook[];
 }
+
+/**
+ * Parse WRITE_HOOKS env var — JSON array of WriteHook objects.
+ * Returns empty array on missing/invalid input.
+ */
+export const parseWriteHooks = (raw: string | undefined): WriteHook[] => {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (h: any) => h.match && (h.match.entity || h.match.entity_type) && h.action && h.target
+    );
+  } catch {
+    console.error('[CONFIG] Failed to parse WRITE_HOOKS:', raw);
+    return [];
+  }
+};
 
 /**
  * Load configuration from environment variables with sensible defaults
@@ -95,6 +116,7 @@ export const loadConfig = (): Config => {
     agentCredentials,
     authRequired: agentCredentials.size > 0,
     agentReadGrants: parseReadGrants(process.env.AGENT_READ_GRANTS),
+    writeHooks: parseWriteHooks(process.env.WRITE_HOOKS),
   };
 };
 

@@ -78,7 +78,9 @@ export class SqliteStorageService {
     for (const ddl of ALL_DDL) {
       this.db.exec(ddl);
     }
+
   }
+
 
   // ── Entity operations ──────────────────────────────────────────
 

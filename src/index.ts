@@ -66,7 +66,7 @@ const port = portIndex !== -1 ? parseInt(args[portIndex + 1], 10) : 3100;
 
 // Create SQLite storage and knowledge graph manager
 const storage = new SqliteStorageService(config.dbPath);
-const knowledgeGraphManager = new KnowledgeGraphManager(storage);
+const knowledgeGraphManager = new KnowledgeGraphManager(storage, config.writeHooks);
 
 /**
  * Create and configure an MCP server instance with tool handlers
@@ -330,6 +330,11 @@ async function startSSE() {
     });
   });
 
+  // JSON 404 for unknown routes — prevents HTML responses that break MCP SDK OAuth probes
+  app.use((_req: Request, res: Response) => {
+    res.status(404).json({ error: 'Not found' });
+  });
+
   app.listen(port, () => {
     console.error(`j5ed-knowledge-graph running on SSE at http://localhost:${port}`);
     console.error(`  SSE endpoint: http://localhost:${port}/sse`);
@@ -423,6 +428,11 @@ async function startHTTP() {
       tenantIsolation: true,
       storage: 'sqlite'
     });
+  });
+
+  // JSON 404 for unknown routes — prevents HTML responses that break MCP SDK OAuth probes
+  app.use((_req: Request, res: Response) => {
+    res.status(404).json({ error: 'Not found' });
   });
 
   app.listen(port, () => {

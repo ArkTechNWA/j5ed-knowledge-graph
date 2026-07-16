@@ -1,3 +1,4 @@
+import { executeHooks } from '../hooks/write-hooks.js';
 import { SqliteStorageService, EntityRow, ObservationRow, RelationRow } from '../persistence/sqlite-storage.js';
 import { config } from '../utils/config.js';
 import {
@@ -12,7 +13,9 @@ import {
   ObservationDeletion,
   GraphSummary,
   SearchResult,
-  SearchTier
+  SearchTier,
+  WriteHook,
+  WriteEvent
 } from '../types/graph.js';
 
 /**
@@ -20,9 +23,11 @@ import {
  */
 export class KnowledgeGraphManager {
   private storage: SqliteStorageService;
+  private hooks: WriteHook[];
 
-  constructor(storage: SqliteStorageService) {
+  constructor(storage: SqliteStorageService, hooks?: WriteHook[]) {
     this.storage = storage;
+    this.hooks = hooks || [];
   }
 
   // ── Tenant helpers ─────────────────────────────────────────────
@@ -77,7 +82,7 @@ export class KnowledgeGraphManager {
   // ── Write operations ──────────────────────────────────────────
 
   async createEntities(entities: Entity[], agentContext?: AgentContext): Promise<Entity[]> {
-    return this.storage.transaction(() => {
+    const result = this.storage.transaction(() => {
       const created: Entity[] = [];
 
       for (const input of entities) {
@@ -105,10 +110,20 @@ export class KnowledgeGraphManager {
 
       return created;
     });
+
+    if (result.length > 0) {
+      executeHooks({
+        entityNames: result.map(e => e.name),
+        entityTypes: result.map(e => e.entityType),
+        operation: 'create',
+      }, this.hooks);
+    }
+
+    return result;
   }
 
   async createRelations(relations: Relation[], agentContext?: AgentContext): Promise<Relation[]> {
-    return this.storage.transaction(() => {
+    const result = this.storage.transaction(() => {
       const created: Relation[] = [];
       const agentId = agentContext?.agentId || config.defaultAgentId;
 
@@ -134,10 +149,21 @@ export class KnowledgeGraphManager {
 
       return created;
     });
+
+    if (result.length > 0) {
+      const relatedNames = [...new Set(result.flatMap(r => [r.from, r.to]))];
+      executeHooks({
+        entityNames: relatedNames,
+        entityTypes: [],
+        operation: 'create',
+      }, this.hooks);
+    }
+
+    return result;
   }
 
   async addObservations(inputs: ObservationInput[], agentContext?: AgentContext): Promise<ObservationResult[]> {
-    return this.storage.transaction(() => {
+    const result = this.storage.transaction(() => {
       const results: ObservationResult[] = [];
       const agentId = agentContext?.agentId || config.defaultAgentId;
       const userId = agentContext?.userId || null;
@@ -170,9 +196,21 @@ export class KnowledgeGraphManager {
 
       return results;
     });
+
+    const updatedNames = result.filter(r => r.addedObservations.length > 0).map(r => r.entityName);
+    if (updatedNames.length > 0) {
+      executeHooks({
+        entityNames: updatedNames,
+        entityTypes: [],
+        operation: 'update',
+      }, this.hooks);
+    }
+
+    return result;
   }
 
   async deleteEntities(entityNames: string[], agentContext?: AgentContext): Promise<void> {
+    const deleted: { name: string; type: string }[] = [];
     this.storage.transaction(() => {
       const agentId = agentContext?.agentId || 'system';
 
@@ -193,11 +231,21 @@ export class KnowledgeGraphManager {
         this.storage.softDeleteRelationsForEntity(entity.id, agentId);
 
         console.error(`[AUDIT] agent=${agentId} soft-deleted entity: ${name}`);
+        deleted.push({ name: entity.name, type: entity.entity_type });
       }
     });
+
+    if (deleted.length > 0) {
+      executeHooks({
+        entityNames: deleted.map(d => d.name),
+        entityTypes: deleted.map(d => d.type),
+        operation: 'delete',
+      }, this.hooks);
+    }
   }
 
   async deleteObservations(deletions: ObservationDeletion[], agentContext?: AgentContext): Promise<void> {
+    const affectedNames: string[] = [];
     this.storage.transaction(() => {
       const agentId = agentContext?.agentId || 'system';
 
@@ -216,11 +264,21 @@ export class KnowledgeGraphManager {
             this.storage.softDeleteObservation(obs.id, agentId);
           }
         }
+        affectedNames.push(deletion.entityName);
       }
     });
+
+    if (affectedNames.length > 0) {
+      executeHooks({
+        entityNames: affectedNames,
+        entityTypes: [],
+        operation: 'update',
+      }, this.hooks);
+    }
   }
 
   async deleteRelations(relations: Relation[], agentContext?: AgentContext): Promise<void> {
+    const deletedRelNames: string[] = [];
     this.storage.transaction(() => {
       const agentId = agentContext?.agentId || 'system';
 
@@ -237,9 +295,18 @@ export class KnowledgeGraphManager {
         const existing = this.storage.findLiveRelation(fromEntity.id, toEntity.id, rel.relationType);
         if (existing) {
           this.storage.softDeleteRelation(existing.id, agentId);
+          deletedRelNames.push(rel.from, rel.to);
         }
       }
     });
+
+    if (deletedRelNames.length > 0) {
+      executeHooks({
+        entityNames: [...new Set(deletedRelNames)],
+        entityTypes: [],
+        operation: 'delete',
+      }, this.hooks);
+    }
   }
 
   // ── Read operations ───────────────────────────────────────────
@@ -522,7 +589,12 @@ export class KnowledgeGraphManager {
   ): Promise<number> {
     const authoredBy = agentContext?.agentId || config.defaultAgentId;
     const userId = agentContext?.userId || null;
-    return this.storage.supersedeObservation(observationId, newContent, authoredBy, rationale, userId);
+    const newId = this.storage.supersedeObservation(observationId, newContent, authoredBy, rationale, userId);
+
+    // Fire hooks — we don't easily know the entity name here, so skip for now
+    // The observation-level supersede is a low-frequency operation
+
+    return newId;
   }
 
   // ── Helpers ───────────────────────────────────────────────────

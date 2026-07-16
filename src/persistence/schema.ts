@@ -108,6 +108,43 @@ export const CREATE_FTS_TRIGGERS = `
   END;
 `;
 
+
+// ── Boot change flag table + triggers ─────────────────────────────
+// Flag table in the main DB. Triggers fire ONLY when Brick's
+// MY_BOOT entity is modified (insert or supersede).
+// WAL watcher checks this table — exits in <10ms for non-boot writes.
+
+export const CREATE_BOOT_FLAG_TABLE = `
+  CREATE TABLE IF NOT EXISTS boot_change_flags (
+    id     INTEGER PRIMARY KEY,
+    agent  TEXT    NOT NULL,
+    entity TEXT    NOT NULL,
+    ts     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  );
+`;
+
+export const CREATE_BOOT_FLAG_TRIGGERS = `
+  CREATE TRIGGER IF NOT EXISTS brick_boot_changed
+  AFTER INSERT ON observations
+  WHEN NEW.entity_id = (
+    SELECT id FROM entities WHERE name = 'MY_BOOT' AND created_by = 'brick'
+  )
+  BEGIN
+    INSERT INTO boot_change_flags (agent, entity)
+    VALUES ('brick', 'MY_BOOT');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS brick_boot_superseded
+  AFTER UPDATE OF superseded_at ON observations
+  WHEN OLD.entity_id = (
+    SELECT id FROM entities WHERE name = 'MY_BOOT' AND created_by = 'brick'
+  )
+  BEGIN
+    INSERT INTO boot_change_flags (agent, entity)
+    VALUES ('brick', 'MY_BOOT');
+  END;
+`;
+
 /**
  * Execute all DDL in order to initialize a fresh database.
  */
@@ -120,4 +157,6 @@ export const ALL_DDL = [
   CREATE_UNIQUE_LIVE_RELATION,
   CREATE_FTS,
   CREATE_FTS_TRIGGERS,
+  CREATE_BOOT_FLAG_TABLE,
+  CREATE_BOOT_FLAG_TRIGGERS,
 ];
