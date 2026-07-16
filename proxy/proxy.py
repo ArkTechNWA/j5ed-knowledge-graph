@@ -124,6 +124,19 @@ def retrieve_memories(query_embedding: bytes, k: int) -> list[dict]:
 
 # ── Injection logic ───────────────────────────────────────────────
 
+def strip_xml_tags(text: str) -> str:
+    """Remove <system-reminder>...</system-reminder> and similar XML blocks."""
+    import re
+    # Remove full XML blocks (system-reminder, local-command, etc.)
+    text = re.sub(r'<system-reminder>.*?</system-reminder>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<local-command-.*?>.*?</local-command-.*?>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<bash-.*?>.*?</bash-.*?>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<command-.*?>.*?</command-.*?>', '', text, flags=re.DOTALL)
+    # Collapse whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
 def build_query_text(messages: list[dict]) -> str:
     """Extract last 2-3 turns as query text, cap at 500 chars."""
     relevant = []
@@ -138,7 +151,10 @@ def build_query_text(messages: list[dict]) -> str:
                     if isinstance(b, dict) and b.get("type") == "text"
                 )
             if content:
-                relevant.append(content)
+                # Strip system-injected XML before using as query
+                content = strip_xml_tags(content)
+                if content:
+                    relevant.append(content)
         if len(relevant) >= 3:
             break
 
@@ -167,6 +183,7 @@ def should_inject(messages: list[dict]) -> bool:
     else:
         text = content
 
+    text = strip_xml_tags(text)
     return len(text.strip()) >= 10
 
 
@@ -234,21 +251,40 @@ def format_injection(memories: list[dict]) -> str:
 
 
 def inject_into_body(body: dict, injection: str) -> dict:
-    """Prepend ambient_recall block to the system message."""
+    """Inject ambient recall as a user message in the conversation.
+
+    Appended as the last user message content block, so the model sees it
+    as context provided alongside the user's input. System prompt is NEVER
+    modified — that's Anthropic's territory.
+    """
     if not injection:
         return body
 
-    body = body.copy()
-    system = body.get("system", "")
+    import copy
+    body = copy.deepcopy(body)
+    messages = body.get("messages", [])
 
-    if isinstance(system, list):
-        # System is content blocks — prepend a text block
-        body["system"] = [{"type": "text", "text": injection}] + system
-    elif isinstance(system, str) and system:
-        body["system"] = injection + "\n\n" + system
-    else:
-        body["system"] = injection
+    if not messages:
+        return body
 
+    # Find the last user message and append the recall as a content block
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            content = messages[i].get("content", "")
+            recall_block = {"type": "text", "text": injection}
+
+            if isinstance(content, list):
+                # Content is already blocks — append ours
+                messages[i]["content"] = content + [recall_block]
+            elif isinstance(content, str):
+                # Content is a string — convert to blocks
+                messages[i]["content"] = [
+                    {"type": "text", "text": content},
+                    recall_block,
+                ]
+            break
+
+    body["messages"] = messages
     return body
 
 
@@ -280,6 +316,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 client = httpx.AsyncClient(base_url=cfg.UPSTREAM_URL, timeout=300.0)
+
+# Serialize upstream requests to prevent concurrent 429s
+# Claude Code sends two POST /v1/messages simultaneously on startup
+# (fast-mode probe + real request). Without serialization, both hit
+# Anthropic concurrently and one gets 429.
+# The semaphore holds through the FULL response (including streaming body)
+# so requests are truly sequential end-to-end.
+import asyncio
+_upstream_sem = asyncio.Semaphore(1)
 
 
 @app.get("/health")
@@ -317,6 +362,13 @@ async def health():
     )
 
 
+@app.head("/")
+@app.get("/")
+async def root():
+    """Connectivity check — Claude Code sends HEAD / on startup."""
+    return JSONResponse({"status": "ok", "proxy": "ambient-recall"})
+
+
 @app.api_route("/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_request(request: Request, path: str):
     """Proxy all requests to upstream, injecting ambient recall on /v1/messages."""
@@ -325,54 +377,67 @@ async def proxy_request(request: Request, path: str):
     url = f"/{path}"
     if query_string:
         url = f"/{path}?{query_string}"
-    headers = dict(request.headers)
-    headers.pop("host", None)
-    headers.pop("content-length", None)  # recalculated by httpx after body modification
+    # Forward all headers except hop-by-hop and size headers (httpx rebuilds these)
+    STRIP_HEADERS = {"host", "content-length", "transfer-encoding", "content-encoding", "connection"}
+    raw_headers = dict(request.headers)
+    headers = {k: v for k, v in raw_headers.items() if k.lower() not in STRIP_HEADERS}
 
-    # Forward API key
-    if cfg.ANTHROPIC_API_KEY and "x-api-key" not in headers:
+    # Auth: forward whatever Claude Code sends (OAuth Bearer or x-api-key)
+    # If ANTHROPIC_API_KEY is set and no auth present, use it as fallback
+    if cfg.ANTHROPIC_API_KEY and "x-api-key" not in headers and "authorization" not in headers:
         headers["x-api-key"] = cfg.ANTHROPIC_API_KEY
 
     body_bytes = await request.body()
 
     injection_log = None
 
-    # Only intercept POST /v1/messages
+    # Intercept POST /v1/messages for ambient recall injection
+    # Skip small requests (<10KB) — these are Claude Code system negotiations
+    # that don't contain user conversation and would cause concurrent 429s
     if request.method == "POST" and path == "v1/messages" and body_bytes:
         try:
             body = json.loads(body_bytes)
             messages = body.get("messages", [])
+            print(f"[AMBIENT] Parsed body: {len(messages)} messages, system={'present' if body.get('system') else 'absent'}", flush=True)
 
-            if should_inject(messages):
+            inject = should_inject(messages)
+            print(f"[AMBIENT] should_inject={inject}", flush=True)
+
+            if inject:
                 t0 = time.time()
 
-                # Build query from recent turns
                 query_text = build_query_text(messages)
+                print(f"[AMBIENT] Query: {query_text[:100]!r}", flush=True)
 
-                # Embed the query
                 query_emb = embed_text(query_text)
+                print(f"[AMBIENT] Embedded query ({len(query_emb)} bytes)", flush=True)
 
-                # Retrieve candidates
                 candidates = retrieve_memories(query_emb, cfg.KNN_K)
+                print(f"[AMBIENT] Retrieved {len(candidates)} candidates", flush=True)
+                if candidates:
+                    print(f"[AMBIENT] Top 3 scores: {[round(c['similarity'], 3) for c in candidates[:3]]}", flush=True)
 
-                # Filter and budget
                 conv_hash = get_conv_hash(body)
                 turn = _conv_turns[conv_hash] + 1
-                _conv_turns[conv_hash] = turn
+                # Don't increment turn counter yet — only after successful forward
 
                 selected = filter_and_budget(candidates, conv_hash, turn)
+                print(f"[AMBIENT] Selected {len(selected)} after filtering (tau={cfg.TAU_INJECT})", flush=True)
 
                 if selected:
-                    # Format and inject
                     injection = format_injection(selected)
+                    print(f"[AMBIENT] INJECTING {len(selected)} memories ({len(injection)} chars)", flush=True)
                     body = inject_into_body(body, injection)
                     body_bytes = json.dumps(body).encode()
+                    print(f"[AMBIENT] Body grew to {len(body_bytes)} bytes", flush=True)
 
-                    # Track injected IDs
                     for mem in selected:
                         _conv_state[conv_hash][mem["obs_id"]] = turn
+                else:
+                    print(f"[AMBIENT] Nothing passed filter — no injection", flush=True)
 
                 latency_ms = int((time.time() - t0) * 1000)
+                print(f"[AMBIENT] Total injection latency: {latency_ms}ms", flush=True)
 
                 injection_log = {
                     "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -387,8 +452,21 @@ async def proxy_request(request: Request, path: str):
                     "latency_ms": latency_ms,
                 }
         except Exception as e:
-            # Best-effort: if anything fails, pass through unmodified
-            print(f"[AMBIENT] Injection failed, passing through: {e}", flush=True)
+            import traceback
+            print(f"[AMBIENT] INJECTION EXCEPTION: {e}", flush=True)
+            traceback.print_exc()
+
+    # Debug: log what we're about to forward
+    print(f"[AMBIENT] >>> {request.method} {url}", flush=True)
+    print(f"[AMBIENT] >>> Headers forwarded: {list(headers.keys())}", flush=True)
+    if 'x-api-key' in headers:
+        key = headers['x-api-key']
+        print(f"[AMBIENT] >>> Auth: x-api-key {key[:12]}...{key[-4:]}", flush=True)
+    elif 'authorization' in headers:
+        print(f"[AMBIENT] >>> Auth: Bearer token (OAuth)", flush=True)
+    else:
+        print(f"[AMBIENT] >>> WARNING: No auth header!", flush=True)
+    print(f"[AMBIENT] >>> Body size: {len(body_bytes)} bytes", flush=True)
 
     # Check if streaming is requested
     is_stream = False
@@ -399,19 +477,31 @@ async def proxy_request(request: Request, path: str):
             pass
 
     if is_stream:
-        # Stream the response
-        upstream_req = client.build_request(
-            method=request.method,
-            url=url,
-            headers=headers,
-            content=body_bytes,
-        )
-        upstream_resp = await client.send(upstream_req, stream=True)
+        # Hold semaphore through entire response (including streaming body)
+        # to prevent concurrent requests from overlapping at Anthropic
+        await _upstream_sem.acquire()
+        try:
+            upstream_req = client.build_request(
+                method=request.method,
+                url=url,
+                headers=headers,
+                content=body_bytes,
+            )
+            upstream_resp = await client.send(upstream_req, stream=True)
+        except Exception:
+            _upstream_sem.release()
+            raise
 
         async def stream_body():
-            async for chunk in upstream_resp.aiter_bytes():
-                yield chunk
-            await upstream_resp.aclose()
+            try:
+                async for chunk in upstream_resp.aiter_bytes():
+                    yield chunk
+            finally:
+                await upstream_resp.aclose()
+                # Brief cooldown before releasing — Anthropic's rate limiter
+                # may still consider the connection active for a short window
+                await asyncio.sleep(0.5)
+                _upstream_sem.release()
 
         if injection_log:
             log_event(injection_log)
@@ -425,8 +515,9 @@ async def proxy_request(request: Request, path: str):
             headers=resp_headers,
         )
     else:
-        # Non-streaming: forward and return
-        upstream_resp = await client.request(
+        # Non-streaming: forward and return (serialized)
+        async with _upstream_sem:
+            upstream_resp = await client.request(
             method=request.method,
             url=url,
             headers=headers,
