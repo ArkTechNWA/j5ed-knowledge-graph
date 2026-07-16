@@ -412,10 +412,13 @@ async def proxy_request(request: Request, path: str):
         if injection_log:
             log_event(injection_log)
 
+        # Strip headers that httpx already handled (decompression, framing)
+        resp_headers = {k: v for k, v in upstream_resp.headers.items()
+                       if k.lower() not in ("content-length", "transfer-encoding", "content-encoding")}
         return StreamingResponse(
             stream_body(),
             status_code=upstream_resp.status_code,
-            headers=dict(upstream_resp.headers),
+            headers=resp_headers,
         )
     else:
         # Non-streaming: forward and return
