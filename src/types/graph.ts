@@ -154,6 +154,31 @@ export interface GraphSummary {
   };
 }
 
+
+/**
+ * Defines a post-write hook that fires when matching entities are mutated.
+ */
+export interface WriteHook {
+  /** Match criteria — at least one of entity or entity_type must be set */
+  match: { entity?: string; entity_type?: string };
+  /** Action to take: touch writes a timestamp file, exec runs a command */
+  action: "touch" | "exec";
+  /** File path (touch) or shell command (exec) */
+  target: string;
+}
+
+/**
+ * Describes what changed in a write operation, used for hook matching.
+ */
+export interface WriteEvent {
+  /** Entity names affected by the write */
+  entityNames: string[];
+  /** Entity types affected by the write */
+  entityTypes: string[];
+  /** Kind of mutation */
+  operation: "create" | "update" | "delete";
+}
+
 /**
  * Identity context for the calling agent.
  * Extracted from transport headers at session creation.
