@@ -317,10 +317,14 @@ async def health():
     )
 
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+@app.api_route("/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_request(request: Request, path: str):
     """Proxy all requests to upstream, injecting ambient recall on /v1/messages."""
+    # Preserve query string from original request
+    query_string = request.url.query
     url = f"/{path}"
+    if query_string:
+        url = f"/{path}?{query_string}"
     headers = dict(request.headers)
     headers.pop("host", None)
     headers.pop("content-length", None)  # recalculated by httpx after body modification
