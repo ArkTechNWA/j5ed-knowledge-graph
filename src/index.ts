@@ -18,6 +18,8 @@ import { allTools } from "./server/api-tools.js";
 import { Entity, Relation, ObservationInput, ObservationDeletion, AgentContext } from "./types/graph.js";
 import { config } from "./utils/config.js";
 import pkg from '../package.json' with { type: 'json' };
+import { OllamaEmbedder } from "./embeddings/ollama-client.js";
+import { EmbedWorker } from "./embeddings/embed-worker.js";
 
 export interface AuthResult {
   authenticated: boolean;
@@ -70,6 +72,13 @@ if (config.embedEnabled) {
   storage.loadVecExtension(config.embedDim);
 }
 const knowledgeGraphManager = new KnowledgeGraphManager(storage, config.writeHooks);
+
+// Start embedding worker if vec is enabled and loaded
+if (config.embedEnabled && storage.vecEnabled) {
+  const embedder = new OllamaEmbedder(config.embedOllamaUrl, config.embedModel, config.embedDim);
+  const embedWorker = new EmbedWorker(storage, embedder, knowledgeGraphManager);
+  embedWorker.start();
+}
 
 /**
  * Create and configure an MCP server instance with tool handlers
