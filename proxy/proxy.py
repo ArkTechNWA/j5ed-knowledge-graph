@@ -29,6 +29,19 @@ from fastapi.responses import StreamingResponse, JSONResponse
 import config as cfg
 
 
+# ── sqlite-vec extension loading ───────────────────────────────
+
+def load_vec_extension(db: sqlite3.Connection) -> None:
+    db.enable_load_extension(True)
+    try:
+        import sqlite_vec
+        sqlite_vec.load(db)
+    except ImportError:
+        from pathlib import Path
+        vec_path = str(Path(__file__).parent.parent / "node_modules/sqlite-vec-linux-x64/vec0")
+        db.load_extension(vec_path)
+
+
 # ── State ──────────────────────────────────────────────────────────
 
 # Per-conversation dedup: conv_hash → { obs_id: last_turn }
@@ -76,6 +89,7 @@ def retrieve_memories(query_embedding: bytes, k: int) -> list[dict]:
     """kNN search against vec_observations, join back to observations + entities."""
     db = sqlite3.connect(f"file:{cfg.DB_PATH}?mode=ro", uri=True)
     db.execute("PRAGMA journal_mode=WAL")
+    load_vec_extension(db)
 
     rows = db.execute("""
         SELECT
@@ -283,6 +297,7 @@ async def health():
     # Database
     try:
         db = sqlite3.connect(f"file:{cfg.DB_PATH}?mode=ro", uri=True)
+        load_vec_extension(db)
         vec_count = db.execute("SELECT COUNT(*) FROM vec_metadata").fetchone()[0]
         live_count = db.execute(
             "SELECT COUNT(*) FROM observations WHERE superseded_at IS NULL"

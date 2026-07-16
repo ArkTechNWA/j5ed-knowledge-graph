@@ -22,6 +22,18 @@ import urllib.error
 from pathlib import Path
 
 
+def load_vec_extension(db: sqlite3.Connection) -> None:
+    """Load sqlite-vec extension into a Python sqlite3 connection."""
+    db.enable_load_extension(True)
+    try:
+        import sqlite_vec
+        sqlite_vec.load(db)
+    except ImportError:
+        # Fallback: try loading from node_modules
+        vec_path = str(Path(__file__).parent.parent / "node_modules/sqlite-vec-linux-x64/vec0")
+        db.load_extension(vec_path)
+
+
 def embed_batch(texts: list[str], url: str, model: str, dim: int) -> list[bytes]:
     """Call Ollama /api/embed with a batch of texts. Returns list of float32 buffers."""
     payload = json.dumps({"model": model, "input": texts}).encode()
@@ -62,6 +74,7 @@ def is_synthetic(content: str) -> bool:
 def backfill(db_path: str, ollama_url: str, model: str, dim: int, batch_size: int):
     """Embed all live observations missing from vec_observations."""
     db = sqlite3.connect(db_path)
+    load_vec_extension(db)
 
     # Check if vec tables exist
     tables = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
@@ -131,6 +144,7 @@ def backfill(db_path: str, ollama_url: str, model: str, dim: int, batch_size: in
 def reconcile(db_path: str):
     """Fix drift: remove orphaned vec rows, remove superseded leaks."""
     db = sqlite3.connect(db_path)
+    load_vec_extension(db)
 
     # 1. Remove vec entries for superseded observations
     superseded = db.execute("""
