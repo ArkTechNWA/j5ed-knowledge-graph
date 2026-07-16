@@ -44,7 +44,8 @@
     "@modelcontextprotocol/sdk": "^1.25.2",
     "@types/better-sqlite3": "^7.6.13",
     "better-sqlite3": "^12.11.1",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "sqlite-vec": "^0.1.9"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

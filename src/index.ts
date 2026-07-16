@@ -66,6 +66,9 @@ const port = portIndex !== -1 ? parseInt(args[portIndex + 1], 10) : 3100;
 
 // Create SQLite storage and knowledge graph manager
 const storage = new SqliteStorageService(config.dbPath);
+if (config.embedEnabled) {
+  storage.loadVecExtension(config.embedDim);
+}
 const knowledgeGraphManager = new KnowledgeGraphManager(storage, config.writeHooks);
 
 /**

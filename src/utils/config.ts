@@ -70,6 +70,11 @@ export interface Config {
   agentReadGrants: Map<string, Set<string>>;
   /** Post-write hooks triggered by entity mutations */
   writeHooks: WriteHook[];
+  /** Embedding configuration for ambient recall */
+  embedEnabled: boolean;
+  embedModel: string;
+  embedDim: number;
+  embedOllamaUrl: string;
 }
 
 /**
@@ -117,6 +122,10 @@ export const loadConfig = (): Config => {
     authRequired: agentCredentials.size > 0,
     agentReadGrants: parseReadGrants(process.env.AGENT_READ_GRANTS),
     writeHooks: parseWriteHooks(process.env.WRITE_HOOKS),
+    embedEnabled: process.env.EMBED_ENABLED === 'true',
+    embedModel: process.env.EMBED_MODEL || 'nomic-embed-text',
+    embedDim: parseInt(process.env.EMBED_DIM || '768', 10),
+    embedOllamaUrl: process.env.EMBED_OLLAMA_URL || 'http://localhost:11434',
   };
 };
 

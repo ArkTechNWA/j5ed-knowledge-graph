@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { PRAGMAS, ALL_DDL } from './schema.js';
+import { PRAGMAS, ALL_DDL, createVecObservationsDDL, CREATE_VEC_METADATA } from './schema.js';
 
 // ── Row types (internal to persistence layer) ──────────────────────
 
@@ -59,6 +59,7 @@ export interface FtsMatchRow {
 
 export class SqliteStorageService {
   public db: Database.Database;
+  public vecEnabled: boolean = false;
 
   constructor(dbPath: string) {
     this.db = new Database(dbPath);
@@ -421,6 +422,58 @@ export class SqliteStorageService {
 
   transaction<T>(fn: () => T): T {
     return this.db.transaction(fn)();
+  }
+
+  // ── Vector embeddings (sqlite-vec) ──────────────────────────
+
+  /**
+   * Load the sqlite-vec extension and create vec tables.
+   * Call after construction. Fails gracefully — sets vecEnabled=false on error.
+   */
+  loadVecExtension(dim: number): void {
+    try {
+      // Dynamic import of sqlite-vec — optional dependency
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const sqliteVec = require('sqlite-vec');
+      sqliteVec.load(this.db);
+      this.db.exec(createVecObservationsDDL(dim));
+      this.db.exec(CREATE_VEC_METADATA);
+      this.vecEnabled = true;
+      console.log(`[VEC] sqlite-vec loaded, dim=${dim}`);
+    } catch (err) {
+      console.warn('[VEC] sqlite-vec not available — embeddings disabled:', (err as Error).message);
+      this.vecEnabled = false;
+    }
+  }
+
+  addVecEmbedding(observationId: number, embedding: Buffer, entityName: string, authoredBy: string): void {
+    if (!this.vecEnabled) return;
+    this.db.prepare(
+      'INSERT OR REPLACE INTO vec_observations(rowid, embedding) VALUES (CAST(? AS INTEGER), ?)'
+    ).run(observationId, embedding);
+    this.db.prepare(
+      'INSERT OR REPLACE INTO vec_metadata(observation_id, entity_name, authored_by) VALUES (?, ?, ?)'
+    ).run(observationId, entityName, authoredBy);
+  }
+
+  deleteVecEmbedding(observationId: number): void {
+    if (!this.vecEnabled) return;
+    this.db.prepare('DELETE FROM vec_observations WHERE rowid = ?').run(observationId);
+    this.db.prepare('DELETE FROM vec_metadata WHERE observation_id = ?').run(observationId);
+  }
+
+  searchVecNearest(embedding: Buffer, k: number): Array<{ observationId: number; distance: number }> {
+    if (!this.vecEnabled) return [];
+    const rows = this.db.prepare(
+      'SELECT rowid AS observationId, distance FROM vec_observations WHERE embedding MATCH ? AND k = ? ORDER BY distance'
+    ).all(embedding, k) as Array<{ observationId: number; distance: number }>;
+    return rows;
+  }
+
+  getVecStats(): { count: number; enabled: boolean } {
+    if (!this.vecEnabled) return { count: 0, enabled: false };
+    const row = this.db.prepare('SELECT COUNT(*) AS cnt FROM vec_metadata').get() as { cnt: number };
+    return { count: row.cnt, enabled: true };
   }
 
   // ── Lifecycle ─────────────────────────────────────────────────
