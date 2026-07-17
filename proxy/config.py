@@ -31,5 +31,17 @@ DEDUP_TURNS = int(os.environ.get("AMBIENT_DEDUP_TURNS", "3"))
 LOG_PATH = os.environ.get("AMBIENT_LOG_PATH",
     str(Path.home() / ".ambient-recall/log.jsonl"))
 
+# Agent filter
+AGENT_FILTER = os.environ.get("AMBIENT_AGENT_FILTER", "johnny5")
+
+# Pruning (V3)
+PRUNE_WINDOW = int(os.environ.get("AMBIENT_PRUNE_WINDOW", "3"))
+
+# Classifier (V3)
+CLASSIFIER_ENABLED = os.environ.get("AMBIENT_CLASSIFIER_ENABLED", "true").lower() in ("true", "1", "yes")
+CLASSIFIER_MODEL = os.environ.get("AMBIENT_CLASSIFIER_MODEL", "supergemma-meral:latest")
+CLASSIFIER_URL = os.environ.get("AMBIENT_CLASSIFIER_URL", "http://localhost:11434")
+CLASSIFIER_THRESHOLD = int(os.environ.get("AMBIENT_CLASSIFIER_THRESHOLD", "5"))
+
 # Server
 PROXY_PORT = int(os.environ.get("AMBIENT_PROXY_PORT", "8780"))
